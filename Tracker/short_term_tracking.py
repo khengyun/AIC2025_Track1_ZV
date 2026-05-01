@@ -6,6 +6,7 @@ from tracker import DeepSort3D
 import torch
 
 import argparse
+from collections import defaultdict
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Short Term Tracking with DeepSort3D")
@@ -49,22 +50,26 @@ if __name__ == "__main__":
         print(f"Created folder '{output_folder}'")
 
     all_detection_files = sorted(glob.glob(os.path.join(detection_folder, '*.txt')))
+    files_by_scene = defaultdict(list)
+    for file_path in all_detection_files:
+        scene_name = os.path.basename(file_path).rsplit('_', 1)[0]
+        files_by_scene[scene_name].append(file_path)
+    feat_by_name = {}
     if use_reid_feat:
         all_feat_files = sorted(glob.glob(os.path.join(reid_feat_folder, '*.pt')))
-    for i in range(0,4):
+        feat_by_name = {os.path.basename(path): path for path in all_feat_files}
+    for scene_name in sorted(files_by_scene):
         # --- Run tracker ---
         tracker = DeepSort3D(max_age=MAX_AGE, min_hits=MIN_HITS, iou_threshold=IOU_THRESHOLD)
-        
-        
-        detection_files = all_detection_files[9000*i:9000*(i+1)]  # Split into 9000 files each
-        if use_reid_feat:
-            feat_files = all_feat_files[9000*i:9000*(i+1)]
+        detection_files = files_by_scene[scene_name]
 
         
-        for frame_num, file_path in enumerate(detection_files):
+        for file_path in detection_files:
+            frame_num = int(os.path.splitext(os.path.basename(file_path))[0].rsplit('_', 1)[1])
             print(f"\n--- Frame {frame_num} ({os.path.basename(file_path)}) ---")
             if use_reid_feat:
-                all_obj_features = torch.load(feat_files[frame_num])
+                feat_file_name = os.path.basename(file_path).replace('.txt', '.pt')
+                all_obj_features = torch.load(feat_by_name[feat_file_name])
             
  
             data = np.loadtxt(file_path)

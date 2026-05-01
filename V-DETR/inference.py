@@ -21,6 +21,7 @@ import tqdm
 MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])  # Color mean for normalization
 import os
 import time
+import glob
 
 def load_config():
     parser = argparse.ArgumentParser(description="V-DETR config loader")
@@ -30,6 +31,7 @@ def load_config():
     parser.add_argument('--data_root', type=str, default='/perception/dataset/PhysicalAI-SmartSpaces/pcd_dataset', help='Directory containing the dataset')
     parser.add_argument('--split_name', type=str, default='test', help='Dataset split name (e.g., test)')
     parser.add_argument('--overlap', type=float, default=0.5)
+    parser.add_argument('--scene_name', action='append', default=None, help='Optional scene filter. Can be passed multiple times.')
     cli_args = parser.parse_args()
 
     # Load YAML config
@@ -46,6 +48,8 @@ def load_config():
         config_dict['output_dir'] = cli_args.output_dir
     if cli_args.overlap is not None:
         config_dict['overlap'] = cli_args.overlap
+    if cli_args.scene_name is not None:
+        config_dict['scene_name'] = cli_args.scene_name
 
     return SimpleNamespace(**config_dict)
 
@@ -113,7 +117,7 @@ def merge_linesets_and_save(linesets, save_path):
 
 # ---------- Inference Pipeline ----------
 
-def process_pcd_to_model_input(ply_path, use_color=True, num_points=1000000):
+def process_pcd_to_model_input(ply_path, device, use_color=True, num_points=1000000):
     MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])
     plydata = PlyData.read(ply_path)
     vertices = np.stack([plydata['vertex'][k] for k in ('x', 'y', 'z', 'red', 'green', 'blue')], axis=-1)
@@ -131,14 +135,14 @@ def process_pcd_to_model_input(ply_path, use_color=True, num_points=1000000):
     pc_max = points[:, :3].max(axis=0)
 
     return {
-        "point_clouds": torch.from_numpy(points).float().unsqueeze(0).cuda(),
-        "point_cloud_dims_min": torch.from_numpy(pc_min).float().unsqueeze(0).cuda(),
-        "point_cloud_dims_max": torch.from_numpy(pc_max).float().unsqueeze(0).cuda()
+        "point_clouds": torch.from_numpy(points).float().unsqueeze(0).to(device),
+        "point_cloud_dims_min": torch.from_numpy(pc_min).float().unsqueeze(0).to(device),
+        "point_cloud_dims_max": torch.from_numpy(pc_max).float().unsqueeze(0).to(device)
     }
 
 
-def load_model(args, dataset_config):
-    model = build_model(args, dataset_config).cuda()
+def load_model(args, dataset_config, device):
+    model = build_model(args, dataset_config).to(device)
     checkpoint = torch.load(args.test_ckpt, map_location="cpu")
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -168,7 +172,7 @@ def process_predictions(outputs, threshold=0.1, num_angle_bin=1):
     return center, size, yaw, classes, objectness_scores#,coners
 
 
-def run_tta_inference_with_nms(model, full_pcd_path, voxel_size=20.0, overlap=0.5,
+def run_tta_inference_with_nms(model, device, full_pcd_path, voxel_size=20.0, overlap=0.5,
                                use_color=True, num_points=100000, iou_threshold=0.1):
     pcd = o3d.io.read_point_cloud(full_pcd_path)
     points = np.asarray(pcd.points)
@@ -223,9 +227,9 @@ def run_tta_inference_with_nms(model, full_pcd_path, voxel_size=20.0, overlap=0.
             pc_max = sampled_points[:, :3].max(axis=0)
 
             input_data = {
-                "point_clouds": torch.from_numpy(sampled_points).float().unsqueeze(0).cuda(),
-                "point_cloud_dims_min": torch.from_numpy(pc_min).float().unsqueeze(0).cuda(),
-                "point_cloud_dims_max": torch.from_numpy(pc_max).float().unsqueeze(0).cuda()
+                "point_clouds": torch.from_numpy(sampled_points).float().unsqueeze(0).to(device),
+                "point_cloud_dims_min": torch.from_numpy(pc_min).float().unsqueeze(0).to(device),
+                "point_cloud_dims_max": torch.from_numpy(pc_max).float().unsqueeze(0).to(device)
             }
             outputs = run_inference(model, input_data)
             centers, sizes, yaws, classes, objectness_scores = process_predictions(outputs)
@@ -281,25 +285,32 @@ def main():
     #parser = make_args_parser()
     args = load_config()
 
-    torch.cuda.set_device(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        torch.cuda.manual_seed_all(0)
     np.random.seed(0)
 
     datasets, dataset_config = build_dataset(args)
-    model = load_model(args, dataset_config)
+    model = load_model(args, dataset_config, device)
 
     
     split_name = args.split_name
     if split_name not in ['val', 'test']:
         raise ValueError(f"Invalid split name: {split_name}. Must be 'val' or 'test'.")
     if split_name == 'test':
-        scene_names = ['Warehouse_017', 'Warehouse_018','Warehouse_019','Warehouse_020']
+        default_scene_names = ['Warehouse_017', 'Warehouse_018', 'Warehouse_019', 'Warehouse_020']
     else:
-        scene_names = ['Hospital_000','Lab_000','Warehouse_015','Warehouse_016']
-    
-    for scene_id, scene_name in enumerate(scene_names):
-        for frame_idx in tqdm.tqdm(range(0, 9000), desc="Processing frames"):
+        default_scene_names = ['Hospital_000', 'Lab_000', 'Warehouse_015', 'Warehouse_016']
+    scene_names = list(getattr(args, 'scene_name', None) or default_scene_names)
+    scene_id_lookup = {scene_name: idx for idx, scene_name in enumerate(default_scene_names)}
+
+    for scene_name in scene_names:
+        scene_id = scene_id_lookup.get(scene_name, len(scene_id_lookup))
+        pcd_files = sorted(glob.glob(os.path.join(args.data_root, split_name, 'pcd', f'{scene_name}_*.ply')))
+        for pcd_path in tqdm.tqdm(pcd_files, desc=f"Processing {scene_name}"):
+            frame_idx = int(os.path.splitext(os.path.basename(pcd_path))[0].rsplit('_', 1)[1])
             output_path = f'{args.output_dir}/{split_name}_det_out/{scene_name}_{frame_idx:05d}.txt'
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             if os.path.exists(output_path):
@@ -308,7 +319,8 @@ def main():
                 f.write(f"# {scene_name} frame {frame_idx}\n")
             centers, sizes, yaws, classes, scores = run_tta_inference_with_nms(
                 model,
-                f'{args.data_root}/{split_name}/pcd/{scene_name}_{frame_idx:05d}.ply',
+                device,
+                pcd_path,
                 voxel_size=20.0,
                 overlap=args.overlap,
                 use_color=args.use_color,

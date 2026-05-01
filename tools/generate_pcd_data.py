@@ -1,13 +1,10 @@
 import os
 import cv2
 import numpy as np
-from PIL import Image
 import h5py
 import json
-import subprocess
 import open3d as o3d
 import time
-import pandas as pd
 
 import argparse
 from typing import Dict, List, Tuple, Optional
@@ -24,8 +21,32 @@ def parse_args():
                         help="Output root directory for generated PLY files.")
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                     help="Splits to process (space-separated). e.g., --splits train val")
+    parser.add_argument("--scene-name", action="append", default=None,
+                        help="Optional scene name filter. Can be passed multiple times.")
+    parser.add_argument("--max-seconds", type=int, default=None,
+                        help="Optional maximum duration to process per scene.")
+    parser.add_argument("--fps", type=int, default=30,
+                        help="Dataset FPS used to convert seconds into frame indices.")
+    parser.add_argument("--frame-stride", type=int, default=None,
+                        help="Optional frame stride. Defaults to 100 for train/val and 1 for test.")
+    parser.add_argument("--max-cameras", type=int, default=None,
+                        help="Optional maximum number of cameras to use per scene.")
     
     return parser.parse_args()
+
+
+def normalize_camera_name(camera_name):
+    camera_names = camera_name.split('_')
+    if len(camera_names) > 1:
+        return camera_names[0] + '_' + f"{int(camera_names[1]):04d}"
+    return camera_names[0] + '_0000'
+
+
+def get_selected_frame_indices(split, max_seconds, fps, frame_stride):
+    if frame_stride is None:
+        frame_stride = 100 if split in {'train', 'val'} else 1
+    max_frame = 9000 if max_seconds is None else min(9000, max_seconds * fps)
+    return list(range(0, max_frame, frame_stride))
 
 def get_calibration_per_camera(calibration_file_path):
     """
@@ -36,12 +57,7 @@ def get_calibration_per_camera(calibration_file_path):
 
     camera_params ={}
     for calib in data['sensors']:
-        camera_name = calib['id']
-        camera_names = camera_name.split('_')
-        if len(camera_names) > 1:
-            camera_name = camera_names[0] + '_' + f"{int(camera_names[1]):04d}"
-        else:
-            camera_name = camera_names[0] + '_0000'
+        camera_name = normalize_camera_name(calib['id'])
         camera_intrinsic = np.array(calib['intrinsicMatrix']).reshape(3, 3)
         camera_intrinsic = camera_intrinsic[0,0], camera_intrinsic[1,1], camera_intrinsic[0,2], camera_intrinsic[1,2]
         camera_extrinsic = np.eye(4)
@@ -97,30 +113,24 @@ def main():
     out_dir = args.out_dir
 
     split_set = args.splits
+    scene_filter = set(args.scene_name) if args.scene_name else None
 
     for split in split_set:
-        if split == 'train' or split == 'val':
-            num_skip_frame = 99
-        else:
-            num_skip_frame = 0
-        domain_name_list = os.listdir(os.path.join(data_root, split))
+        domain_name_list = sorted(os.listdir(os.path.join(data_root, split)))
+        if scene_filter is not None:
+            domain_name_list = [name for name in domain_name_list if name in scene_filter]
+        frame_indices = get_selected_frame_indices(split, args.max_seconds, args.fps, args.frame_stride)
         for domain_idx, domain_name in enumerate(domain_name_list):
             domain_path = os.path.join(data_root, split, domain_name)
             print(f'Processing {domain_path}...')
             camera_params = get_calibration_per_camera(os.path.join(domain_path, 'calibration.json'))
-            camera_name_list = [name.split('.')[0] for name in os.listdir(os.path.join(domain_path,'videos'))]
+            camera_name_list = sorted([name.split('.')[0] for name in os.listdir(os.path.join(domain_path,'videos'))])
+            if args.max_cameras is not None:
+                camera_name_list = camera_name_list[:args.max_cameras]
             video_path_list = [os.path.join(domain_path, 'videos', f'{name}.mp4') for name in camera_name_list]
             depth_map_path_list = [os.path.join(domain_path, 'depth_maps', f'{name}.h5') for name in camera_name_list]
 
-            new_camera_name_list = []
-            for camera_name in camera_name_list:
-                camera_names = camera_name.split('_')
-                if len(camera_names) > 1:
-                    new_camera_name = camera_names[0] + '_' + f"{int(camera_names[1]):04d}"
-                else:
-                    new_camera_name = camera_names[0] + '_0000'
-                new_camera_name_list.append(new_camera_name)
-            camera_name_list = new_camera_name_list
+            camera_name_list = [normalize_camera_name(camera_name) for camera_name in camera_name_list]
 
             depth_map_per_camera = {}
             for idx, depth_map_path in enumerate(depth_map_path_list):
@@ -140,13 +150,14 @@ def main():
                 except Exception as e:
                     print(f"Error opening video file {video_path}: {e}")
             
-            frame_count = 0
-            while True:
+            for frame_count in frame_indices:
                 rgb_image_per_camera = {}
                 depth_image_per_camera = {}
                 for camera_name in video_capture_per_camera:
+                    video_capture_per_camera[camera_name].set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                     ret, frame = video_capture_per_camera[camera_name].read()
                     if not ret:
+                        rgb_image_per_camera = {}
                         break
                     rgb_image_per_camera[camera_name] = frame
                     
@@ -156,6 +167,9 @@ def main():
                         print(f"Error reading depth map for {camera_name}: {e}")
                         depth_map = None
                     depth_image_per_camera[camera_name] = depth_map
+                if not rgb_image_per_camera:
+                    print(f"Stopping {domain_name} at frame {frame_count} because video frames are unavailable.")
+                    break
 
                 output_path = f'{out_dir}/{split}/pcd/{domain_name}_{frame_count:05d}.ply'
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -170,14 +184,8 @@ def main():
                     o3d.io.write_point_cloud(output_path, pcd)
 
                 print(f"{output_path} Point cloud generated in {time.time() - start_time:.2f} seconds.")
-                for camera_name in video_capture_per_camera.keys():
-                    for i in range(num_skip_frame):
-                        ret, frame = video_capture_per_camera[camera_name].read()
-                frame_count += num_skip_frame+1
-                if frame_count >= 9000:
-                    for video in video_capture_per_camera.values():
-                        video.release()
-                    break
+            for video in video_capture_per_camera.values():
+                video.release()
 
     OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit']
     for split in split_set:
@@ -191,7 +199,7 @@ def main():
                 data = json.load(f)
             
             frame_count = 0
-            for frame_count in range(0, 9000, 100):
+            for frame_count in get_selected_frame_indices(split, args.max_seconds, args.fps, args.frame_stride):
                 gt_str_line = []
                 gt = data[str(frame_count)]
                 for obj in gt:
@@ -210,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

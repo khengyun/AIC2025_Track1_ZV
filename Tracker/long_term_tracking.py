@@ -8,19 +8,17 @@ from collections import Counter, defaultdict
 
 
 
-def trajectory_matching(chunk_idx, track_res_folder, reid_feat_folder, output_folder):
+def trajectory_matching(scene_name, track_files, reid_feat_folder, output_folder):
     """
     비디오 내에서 궤적을 재연결하고, 최종적으로 합쳐진 궤적의 길이를 기준으로
     다시 필터링하여 결과를 저장하는 최종 함수.
     """
     # --- 1. Configuration ---
     print("--- 1. Configuration initialization ---")
-    print(f"Track results folder: {track_res_folder}")
+    print(f"Scene name: {scene_name}")
     print(f"ReID features folder: {reid_feat_folder}")
     print(f"Output folder: {output_folder}")
     
-    frames_per_chunk = 9000
-
     MIN_TRAJ_LENGTH = 60
     TIME_THRESHOLD = 600
     DIST_THRESHOLD = 3.0
@@ -29,15 +27,11 @@ def trajectory_matching(chunk_idx, track_res_folder, reid_feat_folder, output_fo
     # --- 2. Trajectory information aggregation ---
     print("\n--- 2. Starting trajectory information aggregation ---")
     
-    all_track_files = sorted(glob.glob(os.path.join(track_res_folder, '*.txt')))
-
-
     trajectories = {}
     
-    print(f"  Loading chunk {chunk_idx} data...")
-    chunk_files = all_track_files[frames_per_chunk*chunk_idx : frames_per_chunk*(chunk_idx+1)]
+    print(f"  Loading scene {scene_name} data...")
     
-    for file_path in chunk_files:
+    for file_path in track_files:
         file_name = os.path.basename(file_path).split('.')[0]
         feat_file_path = os.path.join(reid_feat_folder, f"{file_name}.pt")
         all_obj_features = torch.load(feat_file_path)
@@ -176,7 +170,7 @@ def trajectory_matching(chunk_idx, track_res_folder, reid_feat_folder, output_fo
         for frame, box, cls in zip(frames, boxes, classes):
             cx, cy, cz, w, l, h, yaw = box
             global_id = trajectory  # Use local ID as global ID
-            scene_id = chunk_idx+17  # Fixed value for example, adjust as needed in practice
+            scene_id = int(scene_name.split('_')[1])
             cls = traj_data['dominant_class']  # Unify with dominant class
             results_lines.append(f"{scene_id} {cls} {global_id} {frame} {cx:.2f} {cy:.2f} {cz:.2f} {w:.2f} {l:.2f} {h:.2f} {yaw:.2f}\n")
 
@@ -211,16 +205,21 @@ if __name__ == "__main__":
     if os.path.exists(final_output_path):
         os.remove(final_output_path)
     
-    # Process all chunks (0, 1, 2, 3)
-    for chunk_idx in range(4):
-        print(f"\nProcessing chunk {chunk_idx}...")
-        res = trajectory_matching(chunk_idx, track_res_folder, reid_feat_folder, output_folder)
+    all_track_files = sorted(glob.glob(os.path.join(track_res_folder, '*.txt')))
+    track_files_by_scene = defaultdict(list)
+    for file_path in all_track_files:
+        scene_name = os.path.basename(file_path).rsplit('_', 1)[0]
+        track_files_by_scene[scene_name].append(file_path)
+
+    for scene_name in sorted(track_files_by_scene):
+        print(f"\nProcessing scene {scene_name}...")
+        res = trajectory_matching(scene_name, track_files_by_scene[scene_name], reid_feat_folder, output_folder)
         
-        # Save results for this chunk
-        chunk_output_path = os.path.join(output_folder, f'long_term_chunk_{chunk_idx}.txt')
+        # Save results for this scene
+        chunk_output_path = os.path.join(output_folder, f'long_term_{scene_name}.txt')
         with open(chunk_output_path, 'w') as f:
             f.writelines(res)
-        print(f"Chunk {chunk_idx} results saved to {chunk_output_path}")
+        print(f"Scene {scene_name} results saved to {chunk_output_path}")
         
         # Append to final combined file
         with open(final_output_path, 'a') as f:

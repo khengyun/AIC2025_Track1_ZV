@@ -7,6 +7,7 @@ from tqdm import tqdm
 import os
 import glob
 import argparse
+from collections import defaultdict
 
 from model import VoxelFeatureExtractor
 
@@ -62,6 +63,7 @@ def main():
 
     parser.add_argument('--FourierGR1T2_dir', type=str, default="/perception/dataset/PhysicalAI-SmartSpaces/obj_crop_pcd_dataset/train/0_9998", help="Path to the FourierGR1T2 pcd directory.")
     parser.add_argument('--AgilityDigit_dir', type=str, default="/perception/dataset/PhysicalAI-SmartSpaces/obj_crop_pcd_dataset/train/0_9999", help="Path to the AgilityDigit pcd directory.")
+    parser.add_argument('--scene_name', action='append', default=None, help="Optional scene filter. Can be passed multiple times.")
     
     args = parser.parse_args()
 
@@ -86,19 +88,26 @@ def main():
         gallery2_embeddings = get_gallery_embeddings(gallery2_dir,model,device)
 
     split_name = args.split_name
-    if split_name == 'val':
-        scene_names = ['Hospital_000','Lab_000','Warehouse_015','Warehouse_016']
-    elif split_name == 'test':
-        scene_names = ['Warehouse_017', 'Warehouse_018', 'Warehouse_019', 'Warehouse_020']
+    det_input_dir = f'{args.det_root}/{split_name}_det_out'
+    det_files = sorted(glob.glob(os.path.join(det_input_dir, '*.txt')))
+    if args.scene_name:
+        allowed_scenes = set(args.scene_name)
+        det_files = [path for path in det_files if os.path.basename(path).rsplit('_', 1)[0] in allowed_scenes]
+    scene_to_files = defaultdict(list)
+    for det_file in det_files:
+        scene_to_files[os.path.basename(det_file).rsplit('_', 1)[0]].append(det_file)
+    scene_names = sorted(scene_to_files.keys())
+    if not scene_names:
+        raise FileNotFoundError(f"No detection files found in {det_input_dir} for split {split_name}")
 
     gallery1_neighbor_embeddings = []
     gallery2_neighbor_embeddings = []
 
     for scene_name in scene_names:
-        for pcd_idx in range(0,9000,500):
-            gallery_feats = torch.load(f'{args.reid_feat_root}/{split_name}_reid_feat_out/{scene_name}_{pcd_idx:05d}.pt')
-            detection_txt_path = f'{args.det_root}/{split_name}_det_out/{scene_name}_{pcd_idx:05d}.txt'
-            original_detections = np.loadtxt(detection_txt_path)
+        sample_files = scene_to_files[scene_name][::max(1, len(scene_to_files[scene_name]) // 18 or 1)]
+        for detection_txt_path in sample_files:
+            frame_token = os.path.splitext(os.path.basename(detection_txt_path))[0].rsplit('_', 1)[1]
+            gallery_feats = torch.load(f'{args.reid_feat_root}/{split_name}_reid_feat_out/{scene_name}_{frame_token}.pt')
             obj_keys = list(gallery_feats.keys())
             
             for obj_key in obj_keys:
@@ -123,9 +132,9 @@ def main():
 
     output_dir = f'{args.det_root}/{split_name}_det_out_refine_cls'
     for scene_name in scene_names:
-        for pcd_idx in range(9000):
-            gallery_feats = torch.load(f'{args.reid_feat_root}/{split_name}_reid_feat_out/{scene_name}_{pcd_idx:05d}.pt')
-            detection_txt_path = f'{args.det_root}/{split_name}_det_out/{scene_name}_{pcd_idx:05d}.txt'
+        for detection_txt_path in scene_to_files[scene_name]:
+            frame_token = os.path.splitext(os.path.basename(detection_txt_path))[0].rsplit('_', 1)[1]
+            gallery_feats = torch.load(f'{args.reid_feat_root}/{split_name}_reid_feat_out/{scene_name}_{frame_token}.pt')
             os.makedirs(output_dir, exist_ok=True)
             original_detections = np.loadtxt(detection_txt_path)
             obj_keys = list(gallery_feats.keys())
@@ -147,8 +156,7 @@ def main():
                 if g2_distance < 0.2:
                     g2_matched_row_indices.append(obj_row_idx)
                 
-            if pcd_idx % 10 == 0:
-                print(f"scene_name: {scene_name}, Found {len(g1_matched_row_indices)} matches for query1, {len(g2_matched_row_indices)} matches for query2 at index {pcd_idx:05d} ")
+            print(f"scene_name: {scene_name}, frame {frame_token}, Found {len(g1_matched_row_indices)} matches for query1, {len(g2_matched_row_indices)} matches for query2")
 
             modified_detections = original_detections.copy()
             for idx in g1_matched_row_indices:

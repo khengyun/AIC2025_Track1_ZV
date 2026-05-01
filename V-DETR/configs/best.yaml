@@ -100,7 +100,7 @@ meta_data_dir: null
 dataset_num_workers: 16
 batchsize_per_gpu: 1
 filt_empty: true
-merge_cls: true
+merge_cls: false
 
 
 normal_trans: false
