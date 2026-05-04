@@ -1,0 +1,43 @@
+services:
+  aic2025:
+    build:
+      context: .
+      dockerfile: Dockerfile.full
+    image: aic2025-full:latest
+    container_name: aic2025_full_dev
+
+    working_dir: /workspace/AIC2025_Track1_ZV
+
+    volumes:
+      # Mount data directories as volumes to avoid overwriting compiled artifacts in image
+      - ./dataset:/workspace/AIC2025_Track1_ZV/dataset
+      - ./weights:/workspace/AIC2025_Track1_ZV/weights
+      - ./outputs:/workspace/AIC2025_Track1_ZV/outputs
+      - ./V-DETR/checkpoints:/workspace/AIC2025_Track1_ZV/V-DETR/checkpoints
+      - ./V-DETR/configs:/workspace/AIC2025_Track1_ZV/V-DETR/configs
+
+    # GPU support via docker-compose
+    gpus: all
+
+    # Additional GPU runtime configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ipc: host
+    shm_size: "16gb"
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CUDA_HOME: /usr/local/cuda
+      OMP_NUM_THREADS: 12
+      TORCH_CUDA_ARCH_LIST: "6.1"
+      MAX_JOBS: 3
+
+    stdin_open: true
+    tty: true

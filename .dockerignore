@@ -1,0 +1,33 @@
+# Git / cache
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.cache/
+.vscode/
+.idea/
+
+# Large data
+dataset/
+outputs/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.ply
+*.mp4
+*.h5
+*.zip
+*.tar
+*.tar.gz
+*.npy
+*.npz
+
+# Logs
+*.log
+wandb/
+runs/

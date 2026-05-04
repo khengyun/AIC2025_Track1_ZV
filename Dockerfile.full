@@ -1,0 +1,92 @@
+FROM pytorch/pytorch:1.8.1-cuda10.2-cudnn7-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV TORCH_LIB=/opt/conda/lib/python3.7/site-packages/torch/lib
+ENV LD_LIBRARY_PATH=/opt/conda/lib/python3.7/site-packages/torch/lib:/usr/local/cuda/lib64:/opt/conda/lib:$LD_LIBRARY_PATH
+ENV OMP_NUM_THREADS=12
+ENV TORCH_CUDA_ARCH_LIST="6.1"
+ENV MAX_JOBS=3
+
+RUN rm -f /etc/apt/sources.list.d/cuda.list \
+          /etc/apt/sources.list.d/nvidia-ml.list \
+          /etc/apt/sources.list.d/cuda*.list \
+          /etc/apt/sources.list.d/nvidia*.list || true && \
+    apt-get update && apt-get install -y \
+    git curl ca-certificates \
+    build-essential libopenblas-dev ninja-build patchelf \
+    libprotobuf-dev protobuf-compiler \
+    ffmpeg libsm6 libxext6 libxrender-dev libglib2.0-0 \
+    vim wget htop \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "setuptools==59.5.0" \
+    "wheel" \
+    "numpy==1.21.6" \
+    "typing_extensions" \
+    "ninja" \
+    "cython"
+
+RUN pip install --no-cache-dir \
+    "protobuf==4.24.4" \
+    "safetensors==0.4.5" \
+    "huggingface-hub==0.16.4" \
+    "timm==0.6.13" \
+    "wandb==0.13.11" \
+    "openmim==0.3.9" \
+    "h5py" \
+    "open3d==0.17.0" \
+    "shapely" \
+    "filterpy" \
+    "einops" \
+    "tensorboard" \
+    "tqdm" \
+    "pandas" \
+    "opencv-python"\
+    "plyfile"\
+    "trimesh"
+
+RUN pip install --no-cache-dir mmcv-full==1.6.1 \
+    -f https://download.openmmlab.com/mmcv/dist/cu102/torch1.8.0/index.html
+
+WORKDIR /workspace/AIC2025_Track1_ZV
+
+# Copy full repo into image, so native extensions are built during docker build
+COPY . /workspace/AIC2025_Track1_ZV
+
+# Build MinkowskiEngine with CUDA support
+# FORCE_CUDA=1 required because torch.cuda.is_available() check may fail during build
+RUN export FORCE_CUDA=1 && \
+    export TORCH_CUDA_ARCH_LIST="6.1" && \
+    export CUDA_HOME=/usr/local/cuda && \
+    cd MinkowskiEngine && \
+    python setup.py install --force_cuda --blas_include_dirs=/usr/include/x86_64-linux-gnu --blas=openblas
+
+# Install local pytorch-metric-learning
+RUN cd pytorch-metric-learning && \
+    pip install -e .
+
+# Compile V-DETR cython utils
+RUN cd V-DETR/utils && \
+    python cython_compile.py build_ext --inplace
+
+# Build pointnet2
+RUN cd V-DETR/third_party/pointnet2 && \
+    python setup.py install --user
+
+# Patch pointnet2 RPATH
+RUN export TORCH_LIB=$(python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))") && \
+    export CUDA_HOME=/usr/local/cuda && \
+    PN2_SO=$(find /root/.local/lib/python3.7/site-packages -name "_ext*.so" | grep pointnet2 | head -1) && \
+    echo "pointnet2 so: $PN2_SO" && \
+    if [ -n "$PN2_SO" ]; then \
+        patchelf --set-rpath "$TORCH_LIB:$CUDA_HOME/lib64:/opt/conda/lib" "$PN2_SO"; \
+    fi
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/bin/bash"]
