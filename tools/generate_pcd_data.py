@@ -135,20 +135,29 @@ def main():
             depth_map_per_camera = {}
             for idx, depth_map_path in enumerate(depth_map_path_list):
                 try:
-                    depth_map = h5py.File(depth_map_path, 'r')
-                    depth_map_per_camera[camera_name_list[idx]] = depth_map
+                    if not os.path.exists(depth_map_path):
+                        print(f"Warning: Depth map file not found {depth_map_path}")
+                        depth_map_per_camera[camera_name_list[idx]] = None
+                    else:
+                        depth_map = h5py.File(depth_map_path, 'r')
+                        depth_map_per_camera[camera_name_list[idx]] = depth_map
                 except Exception as e:
                     print(f"Error opening depth map file {depth_map_path}: {e}")
+                    depth_map_per_camera[camera_name_list[idx]] = None
 
             video_capture_per_camera = {}
             for idx, video_path in enumerate(video_path_list):
                 try:
+                    if not os.path.exists(video_path):
+                        print(f"Warning: Video file not found {video_path}")
+                        continue
                     video_capture = cv2.VideoCapture(video_path)
                     if not video_capture.isOpened():
                         raise Exception(f"Cannot open video file: {video_path}")
                     video_capture_per_camera[camera_name_list[idx]] = video_capture
                 except Exception as e:
                     print(f"Error opening video file {video_path}: {e}")
+                    continue
             
             for frame_count in frame_indices:
                 rgb_image_per_camera = {}
@@ -161,11 +170,12 @@ def main():
                         break
                     rgb_image_per_camera[camera_name] = frame
                     
-                    try:
-                        depth_map = depth_map_per_camera[camera_name][f'distance_to_image_plane_{frame_count:05d}.png'][:]
-                    except Exception as e:
-                        print(f"Error reading depth map for {camera_name}: {e}")
-                        depth_map = None
+                    depth_map = None
+                    if depth_map_per_camera.get(camera_name) is not None:
+                        try:
+                            depth_map = depth_map_per_camera[camera_name][f'distance_to_image_plane_{frame_count:05d}.png'][:]
+                        except Exception as e:
+                            print(f"Error reading depth map for {camera_name}: {e}")
                     depth_image_per_camera[camera_name] = depth_map
                 if not rgb_image_per_camera:
                     print(f"Stopping {domain_name} at frame {frame_count} because video frames are unavailable.")
@@ -186,6 +196,11 @@ def main():
                 print(f"{output_path} Point cloud generated in {time.time() - start_time:.2f} seconds.")
             for video in video_capture_per_camera.values():
                 video.release()
+            
+            # Close h5py files to prevent resource leak
+            for depth_map in depth_map_per_camera.values():
+                if depth_map is not None:
+                    depth_map.close()
 
     OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit']
     for split in split_set:
@@ -200,18 +215,28 @@ def main():
             
             frame_count = 0
             for frame_count in get_selected_frame_indices(split, args.max_seconds, args.fps, args.frame_stride):
+                # Skip if frame doesn't exist in ground truth
+                if str(frame_count) not in data:
+                    print(f"Warning: Frame {frame_count} not in ground_truth.json for {domain_name}")
+                    continue
+                
                 gt_str_line = []
                 gt = data[str(frame_count)]
                 for obj in gt:
-                    obj_type = obj['object type']
-                    label = OBJECT_TYPES.index(obj_type)
-                    obj_id = obj['object id']
-                    location = obj['3d location']
-                    scale = obj['3d bounding box scale']
-                    rotation = obj['3d bounding box rotation']
-                    gt_str_line.append(f'{label} {obj_id} {location[0]} {location[1]} {location[2]} {scale[0]} {scale[1]} {scale[2]} {rotation[0]} {rotation[1]} {rotation[2]}')
+                    try:
+                        obj_type = obj['object type']
+                        label = OBJECT_TYPES.index(obj_type)
+                        obj_id = obj['object id']
+                        location = obj['3d location']
+                        scale = obj['3d bounding box scale']
+                        rotation = obj['3d bounding box rotation']
+                        gt_str_line.append(f'{label} {obj_id} {location[0]} {location[1]} {location[2]} {scale[0]} {scale[1]} {scale[2]} {rotation[0]} {rotation[1]} {rotation[2]}')
+                    except (KeyError, ValueError, IndexError) as e:
+                        print(f"Error processing object in frame {frame_count}: {e}")
+                        continue
 
                 gt_txt_path = f'{out_dir}/{split}/gt/{domain_name}_{frame_count:05d}.txt'
+                os.makedirs(os.path.dirname(gt_txt_path), exist_ok=True)
                 with open(gt_txt_path, 'w') as f:
                     for line in gt_str_line:
                         f.write(line + '\n')

@@ -1,0 +1,58 @@
+FROM pytorch/pytorch:1.8.1-cuda10.2-cudnn7-devel
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV TORCH_LIB=/opt/conda/lib/python3.7/site-packages/torch/lib
+ENV OMP_NUM_THREADS=12
+
+# Remove old NVIDIA apt source files to avoid key conflicts
+RUN rm -f /etc/apt/sources.list.d/cuda.list \
+          /etc/apt/sources.list.d/nvidia-ml.list \
+          /etc/apt/sources.list.d/cuda*.list \
+          /etc/apt/sources.list.d/nvidia*.list || true && \
+    apt-get update && apt-get install -y \
+    git curl ca-certificates \
+    build-essential libopenblas-dev ninja-build patchelf \
+    libprotobuf-dev protobuf-compiler \
+    ffmpeg libsm6 libxext6 libxrender-dev libglib2.0-0 \
+    vim wget htop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python build dependencies and core packages
+RUN pip install --no-cache-dir \
+    "setuptools==59.5.0" \
+    "wheel" \
+    "numpy==1.21.6" \
+    "typing_extensions" \
+    "ninja" \
+    "cython"
+
+# Install core dependencies for AIC2025 repo
+RUN pip install --no-cache-dir \
+    "protobuf==4.24.4" \
+    "safetensors==0.4.5" \
+    "huggingface-hub==0.16.4" \
+    "timm==0.6.13" \
+    "wandb==0.13.11" \
+    "openmim==0.3.9" \
+    "h5py" \
+    "open3d==0.17.0" \
+    "shapely" \
+    "filterpy" \
+    "einops" \
+    "tensorboard" \
+    "tqdm"
+
+# Install mmcv-full for correct CUDA 10.2 + PyTorch 1.8 stack
+RUN pip install --no-cache-dir mmcv-full==1.6.1 -f https://download.openmmlab.com/mmcv/dist/cu102/torch1.8.0/index.html
+
+# Setup entrypoint with library path setup
+RUN mkdir -p /workspace
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/bin/bash"]
