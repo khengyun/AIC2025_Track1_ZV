@@ -670,8 +670,7 @@ class GlobalShareCrossAttention(nn.Module):
         relative_coords_table = torch.stack(torch.meshgrid(
             torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
             torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
-            torch.linspace(-max_value, max_value, num_points, dtype=torch.float32),
-            indexing='ij'
+            torch.linspace(-max_value, max_value, num_points, dtype=torch.float32)
         ), dim=-1).unsqueeze(0)
         self.register_buffer("relative_coords_table", relative_coords_table)
         self.max_value = max_value
