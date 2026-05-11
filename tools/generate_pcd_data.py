@@ -161,7 +161,7 @@ def get_existing_ply_action(output_path, overwrite, repair_bad, min_ply_size_mb)
 
 
 def write_point_cloud_atomic(output_path, pcd, min_ply_size_mb):
-    tmp_output_path = output_path + ".tmp"
+    tmp_output_path = output_path.replace(".ply", ".tmp.ply")
     try:
         if os.path.exists(tmp_output_path):
             os.remove(tmp_output_path)
