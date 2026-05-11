@@ -7,6 +7,7 @@ import open3d as o3d
 import time
 
 import argparse
+import concurrent.futures
 from typing import Dict, List, Tuple, Optional
 
 
@@ -19,10 +20,14 @@ def parse_args():
                         help="Dataset root directory.")
     parser.add_argument("--out-dir", type=str, default="dataset/pcd_dataset",
                         help="Output root directory for generated PLY files.")
+    parser.add_argument("--out-layout", choices=["split", "scene"], default="split",
+                        help="Output layout. 'split' writes to <out_dir>/<split>/<scene_name>, 'scene' writes to <out_dir>/<scene_name>.")
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                     help="Splits to process (space-separated). e.g., --splits train val")
     parser.add_argument("--scene-name", action="append", default=None,
                         help="Optional scene name filter. Can be passed multiple times.")
+    parser.add_argument("--no-gt", action="store_true",
+                        help="Skip exporting ground-truth text files for train/val splits.")
     parser.add_argument("--max-seconds", type=int, default=None,
                         help="Optional maximum duration to process per scene.")
     parser.add_argument("--fps", type=int, default=30,
@@ -31,6 +36,14 @@ def parse_args():
                         help="Optional frame stride. Defaults to 100 for train/val and 1 for test.")
     parser.add_argument("--max-cameras", type=int, default=None,
                         help="Optional maximum number of cameras to use per scene.")
+    parser.add_argument("--voxel-size", type=float, default=0.02,
+                        help="Voxel size for downsampling when point count is large.")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="Number of worker processes for per-frame generation. 1 disables multiprocessing.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Overwrite existing PLY files instead of skipping.")
+    parser.add_argument("--gt-only", action="store_true",
+                        help="Only export ground-truth text files and skip PLY generation.")
     
     return parser.parse_args()
 
@@ -69,7 +82,7 @@ def get_calibration_per_camera(calibration_file_path):
     
     return camera_params
 
-def get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params):
+def get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params, voxel_size=0.02):
     pcd_combined = o3d.geometry.PointCloud()
 
     for camera_name in rgb_image_per_camera.keys():
@@ -101,9 +114,138 @@ def get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params)
         pcd_combined += pcd
 
     if len(pcd_combined.points) > 1000000:
-        pcd_combined = pcd_combined.voxel_down_sample(voxel_size=0.02)
+        pcd_combined = pcd_combined.voxel_down_sample(voxel_size=voxel_size)
 
     return pcd_combined
+
+
+def build_pcd_output_path(out_dir, out_layout, split, scene_name, frame_count):
+    if out_layout == "scene":
+        return os.path.join(out_dir, scene_name, f"{scene_name}_{frame_count:05d}.ply")
+    return os.path.join(out_dir, split, scene_name, f"{scene_name}_{frame_count:05d}.ply")
+
+
+def build_gt_output_path(out_dir, out_layout, split, scene_name, frame_count):
+    if out_layout == "scene":
+        return os.path.join(out_dir, scene_name, "gt", f"{scene_name}_{frame_count:05d}.txt")
+    return os.path.join(out_dir, split, scene_name, "gt", f"{scene_name}_{frame_count:05d}.txt")
+
+
+def process_frame_task(task):
+    start_time = time.time()
+    split = task["split"]
+    domain_name = task["domain_name"]
+    domain_path = task["domain_path"]
+    frame_count = task["frame_count"]
+    camera_name_list = task["camera_name_list"]
+    video_path_list = task["video_path_list"]
+    depth_map_path_list = task["depth_map_path_list"]
+    camera_params = task["camera_params"]
+    out_dir = task["out_dir"]
+    out_layout = task["out_layout"]
+    voxel_size = task["voxel_size"]
+    overwrite = task["overwrite"]
+
+    output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if os.path.exists(output_path) and not overwrite:
+        return {
+            "status": "skipped",
+            "path": output_path,
+            "frame": frame_count,
+            "seconds": 0.0,
+        }
+
+    video_capture_per_camera = {}
+    depth_map_per_camera = {}
+    try:
+        for idx, video_path in enumerate(video_path_list):
+            if not os.path.exists(video_path):
+                return {
+                    "status": "missing_video",
+                    "path": output_path,
+                    "frame": frame_count,
+                    "message": f"Video file not found {video_path}",
+                }
+            video_capture = cv2.VideoCapture(video_path)
+            if not video_capture.isOpened():
+                return {
+                    "status": "video_open_failed",
+                    "path": output_path,
+                    "frame": frame_count,
+                    "message": f"Cannot open video file: {video_path}",
+                }
+            video_capture_per_camera[camera_name_list[idx]] = video_capture
+
+        for idx, depth_map_path in enumerate(depth_map_path_list):
+            if not os.path.exists(depth_map_path):
+                depth_map_per_camera[camera_name_list[idx]] = None
+            else:
+                depth_map_per_camera[camera_name_list[idx]] = h5py.File(depth_map_path, 'r')
+
+        rgb_image_per_camera = {}
+        depth_image_per_camera = {}
+        for camera_name in video_capture_per_camera:
+            video_capture_per_camera[camera_name].set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+            ret, frame = video_capture_per_camera[camera_name].read()
+            if not ret:
+                return {
+                    "status": "frame_unavailable",
+                    "path": output_path,
+                    "frame": frame_count,
+                    "message": f"Frame {frame_count} unavailable for {camera_name}",
+                }
+            rgb_image_per_camera[camera_name] = frame
+
+            depth_map = None
+            depth_map_file = depth_map_per_camera.get(camera_name)
+            if depth_map_file is not None:
+                try:
+                    key = f"distance_to_image_plane_{frame_count:05d}.png"
+                    depth_map = depth_map_file[key][:]
+                except Exception:
+                    depth_map = None
+            depth_image_per_camera[camera_name] = depth_map
+
+        if not rgb_image_per_camera:
+            return {
+                "status": "frame_unavailable",
+                "path": output_path,
+                "frame": frame_count,
+                "message": "No RGB frames available",
+            }
+
+        with open(output_path, 'w') as f:
+            f.write(f"# {domain_name} frame {frame_count}\n")
+
+        pcd = get_point_cloud(
+            rgb_image_per_camera,
+            depth_image_per_camera,
+            camera_params,
+            voxel_size=voxel_size,
+        )
+        o3d.io.write_point_cloud(output_path, pcd)
+
+        return {
+            "status": "ok",
+            "path": output_path,
+            "frame": frame_count,
+            "seconds": time.time() - start_time,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "path": output_path,
+            "frame": frame_count,
+            "message": str(e),
+        }
+    finally:
+        for video in video_capture_per_camera.values():
+            video.release()
+        for depth_map in depth_map_per_camera.values():
+            if depth_map is not None:
+                depth_map.close()
 
 
 def main():
@@ -111,11 +253,23 @@ def main():
 
     data_root = args.data_root
     out_dir = args.out_dir
+    out_layout = args.out_layout
+    print(f"Voxel size: {args.voxel_size}")
+    if args.num_workers < 1:
+        args.num_workers = 1
 
     split_set = args.splits
     scene_filter = set(args.scene_name) if args.scene_name else None
 
-    for split in split_set:
+    if args.gt_only and args.no_gt:
+        print("Warning: --gt-only ignores --no-gt.")
+        args.no_gt = False
+
+    split_set_for_ply = [] if args.gt_only else split_set
+    if args.gt_only:
+        print("Skipping PLY generation (--gt-only).")
+
+    for split in split_set_for_ply:
         domain_name_list = sorted(os.listdir(os.path.join(data_root, split)))
         if scene_filter is not None:
             domain_name_list = [name for name in domain_name_list if name in scene_filter]
@@ -132,114 +286,162 @@ def main():
 
             camera_name_list = [normalize_camera_name(camera_name) for camera_name in camera_name_list]
 
-            depth_map_per_camera = {}
-            for idx, depth_map_path in enumerate(depth_map_path_list):
-                try:
-                    if not os.path.exists(depth_map_path):
-                        print(f"Warning: Depth map file not found {depth_map_path}")
+            if args.num_workers <= 1:
+                depth_map_per_camera = {}
+                for idx, depth_map_path in enumerate(depth_map_path_list):
+                    try:
+                        if not os.path.exists(depth_map_path):
+                            print(f"Warning: Depth map file not found {depth_map_path}")
+                            depth_map_per_camera[camera_name_list[idx]] = None
+                        else:
+                            depth_map = h5py.File(depth_map_path, 'r')
+                            depth_map_per_camera[camera_name_list[idx]] = depth_map
+                    except Exception as e:
+                        print(f"Error opening depth map file {depth_map_path}: {e}")
                         depth_map_per_camera[camera_name_list[idx]] = None
-                    else:
-                        depth_map = h5py.File(depth_map_path, 'r')
-                        depth_map_per_camera[camera_name_list[idx]] = depth_map
-                except Exception as e:
-                    print(f"Error opening depth map file {depth_map_path}: {e}")
-                    depth_map_per_camera[camera_name_list[idx]] = None
 
-            video_capture_per_camera = {}
-            for idx, video_path in enumerate(video_path_list):
-                try:
-                    if not os.path.exists(video_path):
-                        print(f"Warning: Video file not found {video_path}")
+                video_capture_per_camera = {}
+                for idx, video_path in enumerate(video_path_list):
+                    try:
+                        if not os.path.exists(video_path):
+                            print(f"Warning: Video file not found {video_path}")
+                            continue
+                        video_capture = cv2.VideoCapture(video_path)
+                        if not video_capture.isOpened():
+                            raise Exception(f"Cannot open video file: {video_path}")
+                        video_capture_per_camera[camera_name_list[idx]] = video_capture
+                    except Exception as e:
+                        print(f"Error opening video file {video_path}: {e}")
                         continue
-                    video_capture = cv2.VideoCapture(video_path)
-                    if not video_capture.isOpened():
-                        raise Exception(f"Cannot open video file: {video_path}")
-                    video_capture_per_camera[camera_name_list[idx]] = video_capture
-                except Exception as e:
-                    print(f"Error opening video file {video_path}: {e}")
-                    continue
-            
-            for frame_count in frame_indices:
-                rgb_image_per_camera = {}
-                depth_image_per_camera = {}
-                for camera_name in video_capture_per_camera:
-                    video_capture_per_camera[camera_name].set(cv2.CAP_PROP_POS_FRAMES, frame_count)
-                    ret, frame = video_capture_per_camera[camera_name].read()
-                    if not ret:
-                        rgb_image_per_camera = {}
-                        break
-                    rgb_image_per_camera[camera_name] = frame
-                    
-                    depth_map = None
-                    if depth_map_per_camera.get(camera_name) is not None:
-                        try:
-                            depth_map = depth_map_per_camera[camera_name][f'distance_to_image_plane_{frame_count:05d}.png'][:]
-                        except Exception as e:
-                            print(f"Error reading depth map for {camera_name}: {e}")
-                    depth_image_per_camera[camera_name] = depth_map
-                if not rgb_image_per_camera:
-                    print(f"Stopping {domain_name} at frame {frame_count} because video frames are unavailable.")
-                    break
-
-                output_path = f'{out_dir}/{split}/pcd/{domain_name}_{frame_count:05d}.ply'
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 
-                start_time = time.time()
-                if not os.path.exists(output_path):
+                for frame_count in frame_indices:
+                    rgb_image_per_camera = {}
+                    depth_image_per_camera = {}
+                    for camera_name in video_capture_per_camera:
+                        video_capture_per_camera[camera_name].set(cv2.CAP_PROP_POS_FRAMES, frame_count)
+                        ret, frame = video_capture_per_camera[camera_name].read()
+                        if not ret:
+                            rgb_image_per_camera = {}
+                            break
+                        rgb_image_per_camera[camera_name] = frame
+                        
+                        depth_map = None
+                        if depth_map_per_camera.get(camera_name) is not None:
+                            try:
+                                depth_map = depth_map_per_camera[camera_name][f'distance_to_image_plane_{frame_count:05d}.png'][:]
+                            except Exception as e:
+                                print(f"Error reading depth map for {camera_name}: {e}")
+                        depth_image_per_camera[camera_name] = depth_map
+                    if not rgb_image_per_camera:
+                        print(f"Stopping {domain_name} at frame {frame_count} because video frames are unavailable.")
+                        break
+
+                    output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    
+                    start_time = time.time()
+                    if os.path.exists(output_path) and not args.overwrite:
+                        print(f"Skipping existing {output_path}")
+                        continue
+
                     with open(output_path, 'w') as f:
                         f.write(f"# {domain_name} frame {frame_count}\n")
 
-                    pcd = get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params)
-                    
+                    pcd = get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params, voxel_size=args.voxel_size)
+
                     o3d.io.write_point_cloud(output_path, pcd)
 
-                print(f"{output_path} Point cloud generated in {time.time() - start_time:.2f} seconds.")
-            for video in video_capture_per_camera.values():
-                video.release()
-            
-            # Close h5py files to prevent resource leak
-            for depth_map in depth_map_per_camera.values():
-                if depth_map is not None:
-                    depth_map.close()
-
-    OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit']
-    for split in split_set:
-        if split == 'test':
-            continue
-        domain_name_list = os.listdir(os.path.join(data_root, split))
-        for domain_name in domain_name_list:
-            domain_path = os.path.join(data_root, split, domain_name)
-            gt_path = os.path.join(domain_path, 'ground_truth.json')
-            with open(gt_path, 'r') as f:
-                data = json.load(f)
-            
-            frame_count = 0
-            for frame_count in get_selected_frame_indices(split, args.max_seconds, args.fps, args.frame_stride):
-                # Skip if frame doesn't exist in ground truth
-                if str(frame_count) not in data:
-                    print(f"Warning: Frame {frame_count} not in ground_truth.json for {domain_name}")
-                    continue
+                    print(f"{output_path} Point cloud generated in {time.time() - start_time:.2f} seconds.")
+                for video in video_capture_per_camera.values():
+                    video.release()
                 
-                gt_str_line = []
-                gt = data[str(frame_count)]
-                for obj in gt:
-                    try:
-                        obj_type = obj['object type']
-                        label = OBJECT_TYPES.index(obj_type)
-                        obj_id = obj['object id']
-                        location = obj['3d location']
-                        scale = obj['3d bounding box scale']
-                        rotation = obj['3d bounding box rotation']
-                        gt_str_line.append(f'{label} {obj_id} {location[0]} {location[1]} {location[2]} {scale[0]} {scale[1]} {scale[2]} {rotation[0]} {rotation[1]} {rotation[2]}')
-                    except (KeyError, ValueError, IndexError) as e:
-                        print(f"Error processing object in frame {frame_count}: {e}")
-                        continue
+                # Close h5py files to prevent resource leak
+                for depth_map in depth_map_per_camera.values():
+                    if depth_map is not None:
+                        depth_map.close()
+            else:
+                tasks = []
+                for frame_count in frame_indices:
+                    tasks.append({
+                        "split": split,
+                        "domain_name": domain_name,
+                        "domain_path": domain_path,
+                        "frame_count": frame_count,
+                        "camera_name_list": camera_name_list,
+                        "video_path_list": video_path_list,
+                        "depth_map_path_list": depth_map_path_list,
+                        "camera_params": camera_params,
+                        "out_dir": out_dir,
+                        "out_layout": out_layout,
+                        "voxel_size": args.voxel_size,
+                        "overwrite": args.overwrite,
+                    })
 
-                gt_txt_path = f'{out_dir}/{split}/gt/{domain_name}_{frame_count:05d}.txt'
-                os.makedirs(os.path.dirname(gt_txt_path), exist_ok=True)
-                with open(gt_txt_path, 'w') as f:
-                    for line in gt_str_line:
-                        f.write(line + '\n')
+                print(f"Using {args.num_workers} worker processes for {domain_name}...")
+                with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_workers) as executor:
+                    futures = [executor.submit(process_frame_task, task) for task in tasks]
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            print(f"Error processing frame task: {e}")
+                            continue
+
+                        status = result.get("status")
+                        path = result.get("path")
+                        seconds = result.get("seconds", 0.0)
+                        frame = result.get("frame")
+                        message = result.get("message")
+
+                        if status == "ok":
+                            print(f"{path} Point cloud generated in {seconds:.2f} seconds.")
+                        elif status == "skipped":
+                            print(f"Skipping existing {path}")
+                        else:
+                            detail = message if message else status
+                            print(f"Warning: {detail} (frame {frame})")
+
+    if not args.no_gt:
+        OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit', 'PalletTruck']
+        for split in split_set:
+            if split == 'test':
+                continue
+            domain_name_list = sorted(os.listdir(os.path.join(data_root, split)))
+            if scene_filter is not None:
+                domain_name_list = [name for name in domain_name_list if name in scene_filter]
+            for domain_name in domain_name_list:
+                domain_path = os.path.join(data_root, split, domain_name)
+                gt_path = os.path.join(domain_path, 'ground_truth.json')
+                with open(gt_path, 'r') as f:
+                    data = json.load(f)
+                
+                frame_count = 0
+                for frame_count in get_selected_frame_indices(split, args.max_seconds, args.fps, args.frame_stride):
+                    # Skip if frame doesn't exist in ground truth
+                    if str(frame_count) not in data:
+                        print(f"Warning: Frame {frame_count} not in ground_truth.json for {domain_name}")
+                        continue
+                    
+                    gt_str_line = []
+                    gt = data[str(frame_count)]
+                    for obj in gt:
+                        try:
+                            obj_type = obj['object type']
+                            label = OBJECT_TYPES.index(obj_type)
+                            obj_id = obj['object id']
+                            location = obj['3d location']
+                            scale = obj['3d bounding box scale']
+                            rotation = obj['3d bounding box rotation']
+                            gt_str_line.append(f'{label} {obj_id} {location[0]} {location[1]} {location[2]} {scale[0]} {scale[1]} {scale[2]} {rotation[0]} {rotation[1]} {rotation[2]}')
+                        except (KeyError, ValueError, IndexError) as e:
+                            print(f"Error processing object in frame {frame_count}: {e}")
+                            continue
+
+                    gt_txt_path = build_gt_output_path(out_dir, out_layout, split, domain_name, frame_count)
+                    os.makedirs(os.path.dirname(gt_txt_path), exist_ok=True)
+                    with open(gt_txt_path, 'w') as f:
+                        for line in gt_str_line:
+                            f.write(line + '\n')
 
 if __name__ == "__main__":
     main()
