@@ -42,6 +42,10 @@ def parse_args():
                         help="Number of worker processes for per-frame generation. 1 disables multiprocessing.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing PLY files instead of skipping.")
+    parser.add_argument("--repair-bad", action="store_true",
+                        help="Regenerate existing PLY files that are missing, too small, or have an invalid header.")
+    parser.add_argument("--min-ply-size-mb", type=float, default=10.0,
+                        help="Minimum valid PLY file size in MB when --repair-bad is enabled.")
     parser.add_argument("--gt-only", action="store_true",
                         help="Only export ground-truth text files and skip PLY generation.")
     
@@ -131,6 +135,71 @@ def build_gt_output_path(out_dir, out_layout, split, scene_name, frame_count):
     return os.path.join(out_dir, split, scene_name, "gt", f"{scene_name}_{frame_count:05d}.txt")
 
 
+def is_valid_ply(path, min_size_mb):
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < min_size_mb * 1024 * 1024:
+        return False
+    try:
+        with open(path, "rb") as f:
+            first_line = f.readline().rstrip(b"\r\n")
+    except OSError:
+        return False
+    return first_line == b"ply"
+
+
+def get_existing_ply_action(output_path, overwrite, repair_bad, min_ply_size_mb):
+    if not os.path.exists(output_path) or overwrite:
+        return "generate_missing"
+    if not repair_bad:
+        return "skip"
+    if is_valid_ply(output_path, min_ply_size_mb):
+        return "skip"
+    return "regenerate_invalid"
+
+
+def write_point_cloud_atomic(output_path, pcd, min_ply_size_mb):
+    tmp_output_path = output_path + ".tmp"
+    try:
+        if os.path.exists(tmp_output_path):
+            os.remove(tmp_output_path)
+        write_ok = o3d.io.write_point_cloud(tmp_output_path, pcd, format="ply")
+        if write_ok and is_valid_ply(tmp_output_path, min_ply_size_mb):
+            os.replace(tmp_output_path, output_path)
+            return True, None
+        message = f"Temporary PLY failed validation: {tmp_output_path}"
+    except Exception as e:
+        message = str(e)
+
+    try:
+        if os.path.exists(tmp_output_path):
+            os.remove(tmp_output_path)
+    except OSError:
+        pass
+    return False, message
+
+
+def new_scene_summary(total_frames):
+    return {
+        "total_frames": total_frames,
+        "skipped_valid": 0,
+        "regenerated_invalid": 0,
+        "generated_missing": 0,
+        "failed": 0,
+    }
+
+
+def print_scene_summary(scene_name, summary):
+    print(
+        f"Summary for {scene_name}: "
+        f"total frames={summary['total_frames']}, "
+        f"skipped valid={summary['skipped_valid']}, "
+        f"regenerated invalid={summary['regenerated_invalid']}, "
+        f"generated missing={summary['generated_missing']}, "
+        f"failed={summary['failed']}"
+    )
+
+
 def process_frame_task(task):
     start_time = time.time()
     split = task["split"]
@@ -145,17 +214,26 @@ def process_frame_task(task):
     out_layout = task["out_layout"]
     voxel_size = task["voxel_size"]
     overwrite = task["overwrite"]
+    repair_bad = task["repair_bad"]
+    min_ply_size_mb = task["min_ply_size_mb"]
+    generated_type = task.get("generated_type")
+    prefiltered = generated_type is not None
 
     output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    if os.path.exists(output_path) and not overwrite:
+    existing_action = get_existing_ply_action(output_path, overwrite, repair_bad, min_ply_size_mb)
+    if generated_type is None:
+        generated_type = existing_action
+    if existing_action == "skip":
         return {
             "status": "skipped",
             "path": output_path,
             "frame": frame_count,
             "seconds": 0.0,
         }
+    if existing_action == "regenerate_invalid" and not prefiltered:
+        print(f"Regenerating invalid PLY {output_path} ...")
 
     video_capture_per_camera = {}
     depth_map_per_camera = {}
@@ -216,22 +294,27 @@ def process_frame_task(task):
                 "message": "No RGB frames available",
             }
 
-        with open(output_path, 'w') as f:
-            f.write(f"# {domain_name} frame {frame_count}\n")
-
         pcd = get_point_cloud(
             rgb_image_per_camera,
             depth_image_per_camera,
             camera_params,
             voxel_size=voxel_size,
         )
-        o3d.io.write_point_cloud(output_path, pcd)
+        write_ok, write_error = write_point_cloud_atomic(output_path, pcd, min_ply_size_mb)
+        if not write_ok:
+            return {
+                "status": "write_failed",
+                "path": output_path,
+                "frame": frame_count,
+                "message": write_error,
+            }
 
         return {
             "status": "ok",
             "path": output_path,
             "frame": frame_count,
             "seconds": time.time() - start_time,
+            "generated_type": generated_type,
         }
     except Exception as e:
         return {
@@ -277,6 +360,7 @@ def main():
         for domain_idx, domain_name in enumerate(domain_name_list):
             domain_path = os.path.join(data_root, split, domain_name)
             print(f'Processing {domain_path}...')
+            scene_summary = new_scene_summary(len(frame_indices))
             camera_params = get_calibration_per_camera(os.path.join(domain_path, 'calibration.json'))
             camera_name_list = sorted([name.split('.')[0] for name in os.listdir(os.path.join(domain_path,'videos'))])
             if args.max_cameras is not None:
@@ -315,6 +399,22 @@ def main():
                         continue
                 
                 for frame_count in frame_indices:
+                    output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+                    existing_action = get_existing_ply_action(
+                        output_path,
+                        args.overwrite,
+                        args.repair_bad,
+                        args.min_ply_size_mb,
+                    )
+                    if existing_action == "skip":
+                        scene_summary["skipped_valid"] += 1
+                        print(f"Skipping existing {output_path}")
+                        continue
+                    if existing_action == "regenerate_invalid":
+                        print(f"Regenerating invalid PLY {output_path} ...")
+
                     rgb_image_per_camera = {}
                     depth_image_per_camera = {}
                     for camera_name in video_capture_per_camera:
@@ -333,23 +433,25 @@ def main():
                                 print(f"Error reading depth map for {camera_name}: {e}")
                         depth_image_per_camera[camera_name] = depth_map
                     if not rgb_image_per_camera:
+                        scene_summary["failed"] += 1
                         print(f"Stopping {domain_name} at frame {frame_count} because video frames are unavailable.")
                         break
 
-                    output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
-                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                    
                     start_time = time.time()
-                    if os.path.exists(output_path) and not args.overwrite:
-                        print(f"Skipping existing {output_path}")
-                        continue
-
-                    with open(output_path, 'w') as f:
-                        f.write(f"# {domain_name} frame {frame_count}\n")
 
                     pcd = get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params, voxel_size=args.voxel_size)
 
-                    o3d.io.write_point_cloud(output_path, pcd)
+                    write_ok, write_error = write_point_cloud_atomic(output_path, pcd, args.min_ply_size_mb)
+                    if not write_ok:
+                        scene_summary["failed"] += 1
+                        detail = write_error if write_error else "write failed"
+                        print(f"Warning: {detail} (frame {frame_count})")
+                        continue
+
+                    if existing_action == "regenerate_invalid":
+                        scene_summary["regenerated_invalid"] += 1
+                    else:
+                        scene_summary["generated_missing"] += 1
 
                     print(f"{output_path} Point cloud generated in {time.time() - start_time:.2f} seconds.")
                 for video in video_capture_per_camera.values():
@@ -359,9 +461,23 @@ def main():
                 for depth_map in depth_map_per_camera.values():
                     if depth_map is not None:
                         depth_map.close()
+                print_scene_summary(domain_name, scene_summary)
             else:
                 tasks = []
                 for frame_count in frame_indices:
+                    output_path = build_pcd_output_path(out_dir, out_layout, split, domain_name, frame_count)
+                    existing_action = get_existing_ply_action(
+                        output_path,
+                        args.overwrite,
+                        args.repair_bad,
+                        args.min_ply_size_mb,
+                    )
+                    if existing_action == "skip":
+                        scene_summary["skipped_valid"] += 1
+                        print(f"Skipping existing {output_path}")
+                        continue
+                    if existing_action == "regenerate_invalid":
+                        print(f"Regenerating invalid PLY {output_path} ...")
                     tasks.append({
                         "split": split,
                         "domain_name": domain_name,
@@ -375,6 +491,9 @@ def main():
                         "out_layout": out_layout,
                         "voxel_size": args.voxel_size,
                         "overwrite": args.overwrite,
+                        "repair_bad": args.repair_bad,
+                        "min_ply_size_mb": args.min_ply_size_mb,
+                        "generated_type": existing_action,
                     })
 
                 print(f"Using {args.num_workers} worker processes for {domain_name}...")
@@ -384,6 +503,7 @@ def main():
                         try:
                             result = future.result()
                         except Exception as e:
+                            scene_summary["failed"] += 1
                             print(f"Error processing frame task: {e}")
                             continue
 
@@ -394,12 +514,19 @@ def main():
                         message = result.get("message")
 
                         if status == "ok":
+                            if result.get("generated_type") == "regenerate_invalid":
+                                scene_summary["regenerated_invalid"] += 1
+                            else:
+                                scene_summary["generated_missing"] += 1
                             print(f"{path} Point cloud generated in {seconds:.2f} seconds.")
                         elif status == "skipped":
+                            scene_summary["skipped_valid"] += 1
                             print(f"Skipping existing {path}")
                         else:
+                            scene_summary["failed"] += 1
                             detail = message if message else status
                             print(f"Warning: {detail} (frame {frame})")
+                print_scene_summary(domain_name, scene_summary)
 
     if not args.no_gt:
         OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit', 'PalletTruck']
