@@ -22,6 +22,8 @@ def parse_args():
                         help="Output root directory for generated PLY files.")
     parser.add_argument("--out-layout", choices=["split", "scene"], default="split",
                         help="Output layout. 'split' writes to <out_dir>/<split>/<scene_name>, 'scene' writes to <out_dir>/<scene_name>.")
+    parser.add_argument("--mode", choices=["all", "pcd", "gt"], default="all",
+                        help="Generation mode: 'all' writes PLY and GT, 'pcd' writes PLY only, 'gt' writes GT only.")
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                     help="Splits to process (space-separated). e.g., --splits train val")
     parser.add_argument("--scene-name", action="append", default=None,
@@ -125,8 +127,8 @@ def get_point_cloud(rgb_image_per_camera, depth_image_per_camera, camera_params,
 
 def build_pcd_output_path(out_dir, out_layout, split, scene_name, frame_count):
     if out_layout == "scene":
-        return os.path.join(out_dir, scene_name, f"{scene_name}_{frame_count:05d}.ply")
-    return os.path.join(out_dir, split, scene_name, f"{scene_name}_{frame_count:05d}.ply")
+        return os.path.join(out_dir, scene_name, "pcd", f"{scene_name}_{frame_count:05d}.ply")
+    return os.path.join(out_dir, split, scene_name, "pcd", f"{scene_name}_{frame_count:05d}.ply")
 
 
 def build_gt_output_path(out_dir, out_layout, split, scene_name, frame_count):
@@ -337,22 +339,34 @@ def main():
     data_root = args.data_root
     out_dir = args.out_dir
     out_layout = args.out_layout
-    print(f"Voxel size: {args.voxel_size}")
     if args.num_workers < 1:
         args.num_workers = 1
 
     split_set = args.splits
     scene_filter = set(args.scene_name) if args.scene_name else None
 
+    if args.gt_only:
+        args.mode = "gt"
     if args.gt_only and args.no_gt:
         print("Warning: --gt-only ignores --no-gt.")
         args.no_gt = False
 
-    split_set_for_ply = [] if args.gt_only else split_set
-    if args.gt_only:
-        print("Skipping PLY generation (--gt-only).")
+    generate_ply = args.mode in {"all", "pcd"}
+    generate_gt = args.mode in {"all", "gt"} and not (args.mode == "all" and args.no_gt)
 
-    for split in split_set_for_ply:
+    print(
+        f"mode={args.mode}, "
+        f"out_layout={args.out_layout}, "
+        f"voxel_size={args.voxel_size}, "
+        f"repair_bad={args.repair_bad}, "
+        f"min_ply_size_mb={args.min_ply_size_mb}"
+    )
+    if not generate_ply:
+        print(f"Skipping PLY generation (--mode {args.mode}).")
+    if not generate_gt:
+        print(f"Skipping GT generation (--mode {args.mode}{' --no-gt' if args.no_gt else ''}).")
+
+    for split in (split_set if generate_ply else []):
         domain_name_list = sorted(os.listdir(os.path.join(data_root, split)))
         if scene_filter is not None:
             domain_name_list = [name for name in domain_name_list if name in scene_filter]
@@ -528,7 +542,7 @@ def main():
                             print(f"Warning: {detail} (frame {frame})")
                 print_scene_summary(domain_name, scene_summary)
 
-    if not args.no_gt:
+    if generate_gt:
         OBJECT_TYPES = ['Person', 'Forklift', 'NovaCarter', 'Transporter', 'FourierGR1T2', 'AgilityDigit', 'PalletTruck']
         for split in split_set:
             if split == 'test':
