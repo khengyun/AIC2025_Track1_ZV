@@ -10,6 +10,18 @@ import numpy as np
 
 o3d = None
 
+CLASS_NAMES = [
+    "Person",
+    "Forklift",
+    "NovaCarter",
+    "Transporter",
+    "FourierGR1T2",
+    "AgilityDigit",
+    "PalletTruck",
+]
+CLASS_TO_LABEL = {name: label for label, name in enumerate(CLASS_NAMES)}
+CLASS_TO_LABEL_LOWER = {name.lower(): label for name, label in CLASS_TO_LABEL.items()}
+
 
 def load_open3d():
     global o3d
@@ -35,17 +47,17 @@ def parse_args():
     parser.add_argument("--ensure-sampled-pcd", action="store_true",
                         help="Ensure sampled PCD files exist by generating missing/invalid sampled frames from raw data when possible.")
     parser.add_argument("--save-generated-pcd", action="store_true", default=True,
-                        help="Save raw-generated sampled PCD files to <pcd-root>/<split>/<scene>/pcd.")
+                        help="Save raw-generated sampled PCD files to <pcd-root>/<scene>/pcd.")
     parser.add_argument("--merge-voxel-size", type=float, default=0.05,
                         help="Voxel size used when generating missing sampled PCD files from raw RGB/depth.")
     parser.add_argument("--max-cameras", type=int, default=None,
                         help="Optional maximum number of cameras to use when generating sampled PCD files from raw data.")
     parser.add_argument("--splits", nargs="+", default=["train"],
-                        help="Splits to process.")
+                        help="Raw data/GT splits to use for selected scenes.")
     parser.add_argument("--scene-name", action="append", default=None,
                         help="Optional scene name filter. Can be passed multiple times.")
     parser.add_argument("--all-scenes", action="store_true",
-                        help="Process all Warehouse_* scenes under each split.")
+                        help="Process all Warehouse_* scenes under <pcd-root>.")
     parser.add_argument("--frame-stride-static", type=int, default=100,
                         help="Sample every N frames for static point cloud generation.")
     parser.add_argument("--voxel-size", type=float, default=0.05,
@@ -64,6 +76,18 @@ def parse_args():
                         help="Number of scene worker processes. 1 disables multiprocessing.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print selected frames and output paths without reading or writing PLY files.")
+    parser.add_argument("--exclude-labeled-objects", action="store_true",
+                        help="Remove GT-labeled object points before accumulating static voxels.")
+    parser.add_argument("--exclude-gt-labels", nargs="*", type=int, default=[],
+                        help="Optional GT class labels to exclude. If set, only these labels are removed.")
+    parser.add_argument("--exclude-gt-classes", nargs="*", default=[],
+                        help="Optional GT class names to exclude. If set, only these classes are removed.")
+    parser.add_argument("--gt-box-scale", type=float, default=1.05,
+                        help="Scale factor applied to GT box extents before point removal.")
+    parser.add_argument("--gt-source", choices=["auto", "json", "txt"], default="auto",
+                        help="GT source for labeled-object exclusion. Auto prefers ground_truth.json then TXT.")
+    parser.add_argument("--gt-yaw-only", action="store_true",
+                        help="Use only yaw (rz) from GT box rotations when removing points.")
     return parser.parse_args()
 
 
@@ -89,19 +113,18 @@ def resolve_roots(args):
         args.background_root = os.path.join(args.processing_root, "point_cloud_background")
 
 
-def get_scene_dirs(pcd_root, split, scene_names, all_scenes=False):
-    split_dir = os.path.join(pcd_root, split)
+def get_scene_dirs(pcd_root, scene_names, all_scenes=False):
     if scene_names and not all_scenes:
         return [
-            os.path.join(split_dir, scene)
+            os.path.join(pcd_root, scene)
             for scene in scene_names
         ]
-    if not os.path.isdir(split_dir):
+    if not os.path.isdir(pcd_root):
         return []
     return [
-        os.path.join(split_dir, name)
-        for name in sorted(os.listdir(split_dir))
-        if name.startswith("Warehouse_") and os.path.isdir(os.path.join(split_dir, name))
+        os.path.join(pcd_root, name)
+        for name in sorted(os.listdir(pcd_root))
+        if name.startswith("Warehouse_") and os.path.isdir(os.path.join(pcd_root, name))
     ]
 
 
@@ -131,14 +154,172 @@ def build_output_paths(scene_dir, scene, voxel_size, background_root=None):
     )
 
 
-def build_pcd_path(pcd_root, split, scene, frame_id):
+def build_pcd_path(pcd_root, scene, frame_id):
     return os.path.join(
         pcd_root,
-        split,
         scene,
         "pcd",
         f"{scene}_{frame_id:05d}.ply",
     )
+
+
+def build_gt_txt_path(pcd_root, scene, frame_id):
+    return os.path.join(
+        pcd_root,
+        scene,
+        "gt",
+        f"{scene}_{frame_id:05d}.txt",
+    )
+
+
+def should_exclude_gt(args):
+    return (
+        args.exclude_labeled_objects
+        or bool(args.exclude_gt_labels)
+        or bool(args.exclude_gt_classes)
+    )
+
+
+def get_excluded_gt_labels(args):
+    labels = set(args.exclude_gt_labels)
+    for class_name in args.exclude_gt_classes:
+        label = CLASS_TO_LABEL_LOWER.get(class_name.lower())
+        if label is None:
+            raise ValueError(
+                f"Unknown GT class '{class_name}'. Valid classes: {', '.join(CLASS_NAMES)}"
+            )
+        labels.add(label)
+    if labels:
+        return labels
+    if args.exclude_labeled_objects:
+        return set(range(len(CLASS_NAMES)))
+    return set()
+
+
+def make_gt_box(label, object_id, center, extent, rotation):
+    return {
+        "label": int(label),
+        "class_name": CLASS_NAMES[int(label)] if 0 <= int(label) < len(CLASS_NAMES) else str(label),
+        "object_id": object_id,
+        "center": np.asarray(center, dtype=np.float64),
+        "extent": np.asarray(extent, dtype=np.float64),
+        "rotation": np.asarray(rotation, dtype=np.float64),
+    }
+
+
+def load_gt_boxes_from_json(args, split, scene, frame_id):
+    if args.data_root is None:
+        return None
+
+    gt_path = os.path.join(args.data_root, split, scene, "ground_truth.json")
+    if not os.path.exists(gt_path):
+        return None
+
+    cache = getattr(args, "_gt_json_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(args, "_gt_json_cache", cache)
+
+    if gt_path not in cache:
+        with open(gt_path, "r") as f:
+            cache[gt_path] = json.load(f)
+
+    frame_key = str(frame_id)
+    if frame_key not in cache[gt_path]:
+        return None
+
+    frame_objects = cache[gt_path].get(frame_key, [])
+    if not isinstance(frame_objects, list):
+        return []
+
+    boxes = []
+    for obj in frame_objects:
+        if not isinstance(obj, dict):
+            continue
+        class_name = obj.get("object type")
+        if class_name not in CLASS_TO_LABEL:
+            continue
+        try:
+            boxes.append(
+                make_gt_box(
+                    CLASS_TO_LABEL[class_name],
+                    obj.get("object id", "unknown"),
+                    obj["3d location"],
+                    obj["3d bounding box scale"],
+                    obj["3d bounding box rotation"],
+                )
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    return boxes
+
+
+def load_gt_boxes_from_txt(args, split, scene, frame_id):
+    gt_path = build_gt_txt_path(args.pcd_root, scene, frame_id)
+    if not os.path.exists(gt_path):
+        return None
+
+    boxes = []
+    with open(gt_path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 11:
+                continue
+            try:
+                label = int(float(parts[0]))
+                object_id = int(parts[1])
+            except ValueError:
+                try:
+                    label = int(float(parts[0]))
+                except ValueError:
+                    continue
+                object_id = parts[1]
+            try:
+                values = [float(value) for value in parts[2:]]
+            except ValueError:
+                continue
+            boxes.append(make_gt_box(label, object_id, values[0:3], values[3:6], values[6:9]))
+    return boxes
+
+
+def load_gt_boxes_for_frame(args, split, scene, frame_id):
+    if args.gt_source in {"auto", "json"}:
+        boxes = load_gt_boxes_from_json(args, split, scene, frame_id)
+        if boxes is not None or args.gt_source == "json":
+            return boxes or []
+
+    boxes = load_gt_boxes_from_txt(args, split, scene, frame_id)
+    if boxes is not None:
+        return boxes
+    return []
+
+
+def remove_points_inside_gt_boxes(pcd, boxes, gt_box_scale, yaw_only):
+    if not boxes or len(pcd.points) == 0:
+        return pcd, 0
+
+    point_count = len(pcd.points)
+    keep_mask = np.ones(point_count, dtype=bool)
+    for box in boxes:
+        center = np.asarray(box["center"], dtype=np.float64)
+        extent = np.asarray(box["extent"], dtype=np.float64) * gt_box_scale
+        rotation = np.asarray(box["rotation"], dtype=np.float64)
+        if yaw_only:
+            R = o3d.geometry.get_rotation_matrix_from_xyz((0.0, 0.0, rotation[2]))
+        else:
+            R = o3d.geometry.get_rotation_matrix_from_xyz(tuple(rotation.tolist()))
+        obb = o3d.geometry.OrientedBoundingBox(center=center, R=R, extent=extent)
+        indices = obb.get_point_indices_within_bounding_box(pcd.points)
+        if indices:
+            keep_mask[np.asarray(indices, dtype=np.int64)] = False
+
+    excluded_points = int(point_count - np.count_nonzero(keep_mask))
+    if excluded_points == 0:
+        return pcd, 0
+
+    kept_indices = np.flatnonzero(keep_mask).astype(np.int64).tolist()
+    filtered_pcd = pcd.select_by_index(kept_indices)
+    return filtered_pcd, excluded_points
 
 
 def get_scene_ply_files(scene_dir, scene):
@@ -487,7 +668,7 @@ def process_scene(args, split, scene_dir):
     if args.dry_run:
         print("  dry-run selected frames:")
         for frame_id in sampled_frame_ids:
-            print(f"    {frame_id:05d}: {build_pcd_path(args.pcd_root, split, scene, frame_id)}")
+            print(f"    {frame_id:05d}: {build_pcd_path(args.pcd_root, scene, frame_id)}")
         return scene_result(scene, split, "processed", output_path, 0, time.time() - start_time)
 
     if args.skip_existing and os.path.exists(output_path) and os.path.exists(summary_path):
@@ -503,6 +684,12 @@ def process_scene(args, split, scene_dir):
     voxel_rgb_sum = defaultdict(lambda: np.zeros(3, dtype=np.float64))
     voxel_point_count = defaultdict(int)
 
+    exclude_gt = should_exclude_gt(args)
+    excluded_label_set = get_excluded_gt_labels(args)
+    excluded_gt_boxes_total = 0
+    excluded_points_total = 0
+    remaining_points_total = 0
+
     valid_sampled_files = 0
     invalid_sampled_files = 0
     generated_missing_pcd_files = 0
@@ -510,7 +697,7 @@ def process_scene(args, split, scene_dir):
     existing_valid_sampled_ply_count = 0
 
     for sampled_idx, frame_id in enumerate(sampled_frame_ids, start=1):
-        ply_path = build_pcd_path(args.pcd_root, split, scene, frame_id)
+        ply_path = build_pcd_path(args.pcd_root, scene, frame_id)
         generated_pcd = None
         if is_valid_ply(ply_path, args.min_ply_size_mb):
             existing_valid_sampled_ply_count += 1
@@ -532,7 +719,31 @@ def process_scene(args, split, scene_dir):
                 continue
 
         try:
-            if generated_pcd is not None and not args.save_generated_pcd:
+            if exclude_gt:
+                if generated_pcd is not None:
+                    pcd = generated_pcd
+                else:
+                    pcd = o3d.io.read_point_cloud(ply_path)
+
+                gt_boxes = load_gt_boxes_for_frame(args, split, scene, frame_id)
+                gt_boxes = [box for box in gt_boxes if box["label"] in excluded_label_set]
+                excluded_gt_boxes_total += len(gt_boxes)
+                pcd, excluded_points = remove_points_inside_gt_boxes(
+                    pcd,
+                    gt_boxes,
+                    args.gt_box_scale,
+                    args.gt_yaw_only,
+                )
+                excluded_points_total += excluded_points
+                point_count, voxel_count = accumulate_point_cloud(
+                    pcd,
+                    args.voxel_size,
+                    voxel_presence_count,
+                    voxel_xyz_sum,
+                    voxel_rgb_sum,
+                    voxel_point_count,
+                )
+            elif generated_pcd is not None and not args.save_generated_pcd:
                 point_count, voxel_count = accumulate_point_cloud(
                     generated_pcd,
                     args.voxel_size,
@@ -557,6 +768,7 @@ def process_scene(args, split, scene_dir):
             continue
 
         valid_sampled_files += 1
+        remaining_points_total += point_count
         if valid_sampled_files % 10 == 0 or sampled_idx == len(sampled_frame_ids):
             print(
                 f"  Progress: {sampled_idx}/{len(sampled_frame_ids)} sampled, "
@@ -568,6 +780,9 @@ def process_scene(args, split, scene_dir):
     print(f"  existing valid sampled PLY count: {existing_valid_sampled_ply_count}")
     print(f"  generated missing PLY count: {generated_missing_pcd_files}")
     print(f"  valid sampled frames: {valid_sampled_files}")
+    print(f"  excluded_gt_boxes_total: {excluded_gt_boxes_total}")
+    print(f"  excluded_points_total: {excluded_points_total}")
+    print(f"  remaining_points_total: {remaining_points_total}")
 
     if valid_sampled_files == 0:
         message = f"no valid sampled frames for {split}/{scene}"
@@ -614,6 +829,15 @@ def process_scene(args, split, scene_dir):
         "presence_ratio": args.presence_ratio,
         "min_presence_frames": min_presence_frames,
         "static_points": static_points,
+        "exclude_labeled_objects": args.exclude_labeled_objects,
+        "exclude_gt_labels": args.exclude_gt_labels,
+        "exclude_gt_classes": args.exclude_gt_classes,
+        "gt_box_scale": args.gt_box_scale,
+        "gt_source": args.gt_source,
+        "gt_yaw_only": args.gt_yaw_only,
+        "excluded_gt_boxes_total": excluded_gt_boxes_total,
+        "excluded_points_total": excluded_points_total,
+        "remaining_points_total": remaining_points_total,
         "elapsed_seconds": elapsed_seconds,
     }
     write_summary(summary_path, summary)
@@ -641,6 +865,12 @@ def main():
         raise ValueError("--max-cameras must be positive when provided.")
     if args.source == "raw" and args.data_root is None:
         raise ValueError("--data-root is required when --source raw is used.")
+    if args.gt_box_scale <= 0:
+        raise ValueError("--gt-box-scale must be positive.")
+    for label in args.exclude_gt_labels:
+        if label < 0 or label >= len(CLASS_NAMES):
+            raise ValueError(f"--exclude-gt-labels values must be between 0 and {len(CLASS_NAMES) - 1}.")
+    get_excluded_gt_labels(args)
     if args.num_workers < 1:
         args.num_workers = 1
 
@@ -663,6 +893,12 @@ def main():
     print(f"  skip_existing: {args.skip_existing}")
     print(f"  num_workers: {args.num_workers}")
     print(f"  dry_run: {args.dry_run}")
+    print(f"  exclude_labeled_objects: {args.exclude_labeled_objects}")
+    print(f"  exclude_gt_labels: {args.exclude_gt_labels}")
+    print(f"  exclude_gt_classes: {args.exclude_gt_classes}")
+    print(f"  gt_box_scale: {args.gt_box_scale}")
+    print(f"  gt_source: {args.gt_source}")
+    print(f"  gt_yaw_only: {args.gt_yaw_only}")
 
     global_start = time.time()
     global_summary = {
@@ -674,10 +910,10 @@ def main():
 
     scene_tasks = []
     for split in args.splits:
-        scene_dirs = get_scene_dirs(args.pcd_root, split, args.scene_name, args.all_scenes)
+        scene_dirs = get_scene_dirs(args.pcd_root, args.scene_name, args.all_scenes)
         print(f"\nSelected scenes for split {split}: {[os.path.basename(path) for path in scene_dirs]}")
         if not scene_dirs:
-            print(f"Warning: no scenes found for split {split}")
+            print(f"Warning: no scenes found under {args.pcd_root}")
             continue
         for scene_dir in scene_dirs:
             scene_tasks.append((split, scene_dir))

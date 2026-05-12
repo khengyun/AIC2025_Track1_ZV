@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import time
 
@@ -31,16 +32,18 @@ def parse_args():
     )
     parser.add_argument("--processing-root", default=None,
                         help="Optional processing root. Uses point_cloud, point_cloud_background, and point_cloud_object below it by default.")
+    parser.add_argument("--data-root", default=None,
+                        help="Optional raw dataset root for ground_truth.json.")
     parser.add_argument("--pcd-root", default=None,
                         help="Root point cloud folder.")
     parser.add_argument("--split", default="train",
-                        help="Split name.")
+                        help="Split name for GT/raw metadata when needed.")
     parser.add_argument("--scene-name", default=None,
                         help="Scene name, e.g. Warehouse_000.")
     parser.add_argument("--frame-id", type=int, default=None,
                         help="Frame id to load.")
     parser.add_argument("--all-scenes", action="store_true",
-                        help="Process all Warehouse_* scenes under <pcd-root>/<split>.")
+                        help="Process all Warehouse_* scenes under <pcd-root>.")
     parser.add_argument("--all-frames", action="store_true",
                         help="Process all frame PLY files under each selected scene.")
     parser.add_argument("--frame-stride-dynamic", type=int, default=1,
@@ -62,7 +65,7 @@ def parse_args():
     parser.add_argument("--show-static", action="store_true",
                         help="Visualize original frame gray, static red, and dynamic green.")
     parser.add_argument("--output-dir", default=None,
-                        help="Optional output directory. Defaults to <pcd-root>/<split>/<scene>/dynamic.")
+                        help="Optional output directory. Defaults to <object-root>/<scene> when available.")
     parser.add_argument("--background-root", default=None,
                         help="Optional root for static/background PLY files.")
     parser.add_argument("--object-root", default=None,
@@ -71,8 +74,18 @@ def parse_args():
                         help="Skip dynamic output files that already exist when --save is enabled.")
     parser.add_argument("--show-gt", action="store_true",
                         help="Visualize GT 3D bounding boxes.")
+    parser.add_argument("--show-gt-labels", action="store_true",
+                        help="Show class names for GT boxes where supported and in saved previews.")
+    parser.add_argument("--show-gt-ids", action="store_true",
+                        help="Show object IDs for GT boxes where supported and in saved previews.")
     parser.add_argument("--gt-path", default=None,
                         help="Optional custom GT txt path.")
+    parser.add_argument("--gt-source", choices=["auto", "json", "txt"], default="auto",
+                        help="GT source. Auto prefers ground_truth.json then per-frame TXT.")
+    parser.add_argument("--gt-box-scale", type=float, default=1.0,
+                        help="Scale factor applied to GT box extents for visualization.")
+    parser.add_argument("--gt-yaw-only", action="store_true",
+                        help="Use only yaw (rz) from GT box rotations.")
     parser.add_argument("--gt-color-by-class", action="store_true",
                         help="Color GT boxes by class instead of using red for all boxes.")
     parser.add_argument("--gt-line-width", type=float, default=2.0,
@@ -89,6 +102,10 @@ def parse_args():
                         help="Optional minimum axis value for height normalization.")
     parser.add_argument("--height-max", type=float, default=None,
                         help="Optional maximum axis value for height normalization.")
+    parser.add_argument("--save-gt-overlay", action="store_true",
+                        help="Save GT overlay metadata JSON next to dynamic outputs.")
+    parser.add_argument("--save-preview-png", action="store_true",
+                        help="Save a top-view PNG of dynamic points and projected GT boxes.")
     return parser.parse_args()
 
 
@@ -129,17 +146,16 @@ def resolve_roots(args):
         args.object_root = os.path.join(args.processing_root, "point_cloud_object")
 
 
-def get_scene_dirs(pcd_root, split, scene_name=None, all_scenes=False):
-    split_dir = os.path.join(pcd_root, split)
+def get_scene_dirs(pcd_root, scene_name=None, all_scenes=False):
     if scene_name and not all_scenes:
-        scene_dir = os.path.join(split_dir, scene_name)
+        scene_dir = os.path.join(pcd_root, scene_name)
         return [scene_dir] if os.path.isdir(scene_dir) else []
-    if not os.path.isdir(split_dir):
+    if not os.path.isdir(pcd_root):
         return []
     return [
-        os.path.join(split_dir, name)
-        for name in sorted(os.listdir(split_dir))
-        if name.startswith("Warehouse_") and os.path.isdir(os.path.join(split_dir, name))
+        os.path.join(pcd_root, name)
+        for name in sorted(os.listdir(pcd_root))
+        if name.startswith("Warehouse_") and os.path.isdir(os.path.join(pcd_root, name))
     ]
 
 
@@ -152,13 +168,13 @@ def parse_frame_id(path, scene_name):
     return int(filename[len(prefix):-len(suffix)])
 
 
-def get_scene_frame_ids(pcd_root, split, scene_name, all_frames, frame_id, frame_stride_dynamic, max_frames):
+def get_scene_frame_ids(pcd_root, scene_name, all_frames, frame_id, frame_stride_dynamic, max_frames):
     if not all_frames:
         if frame_id is None:
             raise ValueError("--frame-id is required unless --all-frames is passed.")
         return [frame_id]
 
-    pcd_dir = os.path.join(pcd_root, split, scene_name, "pcd")
+    pcd_dir = os.path.join(pcd_root, scene_name, "pcd")
     frame_ids = []
     if not os.path.isdir(pcd_dir):
         return frame_ids
@@ -178,17 +194,16 @@ def get_scene_frame_ids(pcd_root, split, scene_name, all_frames, frame_id, frame
     return frame_ids
 
 
-def build_frame_path(pcd_root, split, scene_name, frame_id):
+def build_frame_path(pcd_root, scene_name, frame_id):
     return os.path.join(
         pcd_root,
-        split,
         scene_name,
         "pcd",
         f"{scene_name}_{frame_id:05d}.ply",
     )
 
 
-def build_static_path(pcd_root, split, scene_name, static_voxel_size, background_root=None):
+def build_static_path(pcd_root, scene_name, static_voxel_size, background_root=None):
     if background_root is not None:
         return os.path.join(
             background_root,
@@ -197,7 +212,6 @@ def build_static_path(pcd_root, split, scene_name, static_voxel_size, background
         )
     return os.path.join(
         pcd_root,
-        split,
         scene_name,
         "static",
         f"{scene_name}_static_voxel{voxel_mm(static_voxel_size):03d}.ply",
@@ -213,7 +227,6 @@ def build_output_path(args, scene_name=None, frame_id=None):
     if output_dir is None:
         output_dir = os.path.join(
             args.pcd_root,
-            args.split,
             scene_name,
             "dynamic",
         )
@@ -223,10 +236,27 @@ def build_output_path(args, scene_name=None, frame_id=None):
     )
 
 
-def build_gt_path(pcd_root, split, scene_name, frame_id):
+def build_overlay_json_path(args, scene_name, frame_id):
+    output_dir = args.object_root if args.object_root is not None else args.pcd_root
+    return os.path.join(
+        output_dir,
+        scene_name,
+        f"{scene_name}_{frame_id:05d}_gt_overlay.json",
+    )
+
+
+def build_preview_png_path(args, scene_name, frame_id):
+    output_dir = args.object_root if args.object_root is not None else args.pcd_root
+    return os.path.join(
+        output_dir,
+        scene_name,
+        f"{scene_name}_{frame_id:05d}_dynamic_gt_topview.png",
+    )
+
+
+def build_gt_path(pcd_root, scene_name, frame_id):
     return os.path.join(
         pcd_root,
-        split,
         scene_name,
         "gt",
         f"{scene_name}_{frame_id:05d}.txt",
@@ -301,7 +331,31 @@ def make_painted_copy(pcd, color):
     return painted
 
 
-def load_gt_boxes(gt_path):
+def make_gt_text(class_name, object_id, show_labels=True, show_ids=True):
+    parts = []
+    if show_labels:
+        parts.append(class_name)
+    if show_ids:
+        parts.append(f"#{object_id}")
+    return " ".join(parts)
+
+
+def make_gt_box(label, object_id, center, extent, rotation):
+    class_name = CLASS_NAMES.get(label, f"unknown_{label}")
+    return {
+        "label": int(label),
+        "class_label": int(label),
+        "class_name": class_name,
+        "object_id": object_id,
+        "center": np.asarray(center, dtype=np.float64),
+        "extent": np.asarray(extent, dtype=np.float64),
+        "rotation": np.asarray(rotation, dtype=np.float64),
+        "yaw": float(rotation[2]),
+        "text": make_gt_text(class_name, object_id),
+    }
+
+
+def load_gt_boxes_from_txt(gt_path):
     boxes = []
     with open(gt_path, "r") as f:
         for line_idx, line in enumerate(f, start=1):
@@ -318,7 +372,11 @@ def load_gt_boxes(gt_path):
                 label = int(parts[0])
                 object_id = int(parts[1])
             except ValueError:
-                label = int(float(parts[0]))
+                try:
+                    label = int(float(parts[0]))
+                except ValueError:
+                    print(f"Warning: skipping non-numeric GT label on line {line_idx}: {stripped}")
+                    continue
                 object_id = parts[1]
 
             try:
@@ -330,20 +388,75 @@ def load_gt_boxes(gt_path):
             center = np.asarray(values[0:3], dtype=np.float64)
             extent = np.asarray(values[3:6], dtype=np.float64)
             rotation = np.asarray(values[6:9], dtype=np.float64)
-            boxes.append({
-                "label": label,
-                "object_id": object_id,
-                "center": center,
-                "extent": extent,
-                "rotation": rotation,
-                "yaw": rotation[2],
-            })
+            boxes.append(make_gt_box(label, object_id, center, extent, rotation))
     return boxes
 
 
-def create_o3d_box(center, extent, yaw, color):
-    rotation = o3d.geometry.get_rotation_matrix_from_xyz((0.0, 0.0, yaw))
-    box = o3d.geometry.OrientedBoundingBox(center, rotation, extent)
+def load_gt_boxes_from_json(gt_path, frame_id):
+    with open(gt_path, "r") as f:
+        data = json.load(f)
+
+    frame_key = str(frame_id)
+    if frame_key not in data:
+        return None
+
+    frame_objects = data.get(frame_key, [])
+    if not isinstance(frame_objects, list):
+        return []
+
+    class_to_label = {name: label for label, name in CLASS_NAMES.items()}
+    boxes = []
+    for obj in frame_objects:
+        if not isinstance(obj, dict):
+            continue
+        class_name = obj.get("object type")
+        if class_name not in class_to_label:
+            continue
+        try:
+            boxes.append(
+                make_gt_box(
+                    class_to_label[class_name],
+                    obj.get("object id", "unknown"),
+                    obj["3d location"],
+                    obj["3d bounding box scale"],
+                    obj["3d bounding box rotation"],
+                )
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+    return boxes
+
+
+def load_gt_boxes_for_frame(args, scene_name, frame_id):
+    if args.gt_path:
+        return args.gt_path, load_gt_boxes_from_txt(args.gt_path)
+
+    json_path = None
+    if args.data_root is not None:
+        json_path = os.path.join(args.data_root, args.split, scene_name, "ground_truth.json")
+    txt_path = build_gt_path(args.pcd_root, scene_name, frame_id)
+
+    if args.gt_source in {"auto", "json"} and json_path is not None and os.path.exists(json_path):
+        json_boxes = load_gt_boxes_from_json(json_path, frame_id)
+        if json_boxes is not None or args.gt_source == "json":
+            return json_path, json_boxes or []
+    if args.gt_source == "json":
+        return json_path, []
+    if os.path.exists(txt_path):
+        return txt_path, load_gt_boxes_from_txt(txt_path)
+    return txt_path, []
+
+
+def get_box_rotation(rotation, yaw_only):
+    if yaw_only:
+        return o3d.geometry.get_rotation_matrix_from_xyz((0.0, 0.0, float(rotation[2])))
+    return o3d.geometry.get_rotation_matrix_from_xyz(tuple(np.asarray(rotation, dtype=np.float64).tolist()))
+
+
+def create_o3d_box(box_data, color, scale, yaw_only):
+    rotation = get_box_rotation(box_data["rotation"], yaw_only)
+    extent = np.asarray(box_data["extent"], dtype=np.float64) * scale
+    box = o3d.geometry.OrientedBoundingBox(box_data["center"], rotation, extent)
     lineset = o3d.geometry.LineSet.create_from_oriented_bounding_box(box)
     lineset.paint_uniform_color(color)
     return lineset
@@ -413,29 +526,27 @@ def validate_args(args):
         raise ValueError("--gt-line-width must be positive.")
     if args.frame_stride_dynamic <= 0:
         raise ValueError("--frame-stride-dynamic must be positive.")
+    if args.gt_box_scale <= 0:
+        raise ValueError("--gt-box-scale must be positive.")
     if args.max_frames is not None and args.max_frames <= 0:
         raise ValueError("--max-frames must be positive when provided.")
     if args.height_min is not None and args.height_max is not None and args.height_max <= args.height_min:
         raise ValueError("--height-max must be greater than --height-min when both are provided.")
+    if args.show_gt_labels or args.show_gt_ids:
+        args.show_gt = True
 
 
 def maybe_load_gt(args, scene_name, frame_id, fail_on_missing):
-    if not args.show_gt:
+    if not (args.show_gt or args.save_gt_overlay or args.save_preview_png):
         return []
-    gt_path = args.gt_path if args.gt_path else build_gt_path(
-        args.pcd_root,
-        args.split,
-        scene_name,
-        frame_id,
-    )
+    gt_path, gt_boxes = load_gt_boxes_for_frame(args, scene_name, frame_id)
     print(f"gt_path: {gt_path}")
-    if not os.path.exists(gt_path):
+    if gt_path is None or not os.path.exists(gt_path):
         message = f"GT file does not exist: {gt_path}"
         if fail_on_missing:
             raise FileNotFoundError(message)
         print(f"Warning: {message}")
         return []
-    gt_boxes = load_gt_boxes(gt_path)
     print_gt_summary(gt_path, gt_boxes)
     print(f"gt_line_width: {args.gt_line_width}")
     return gt_boxes
@@ -459,7 +570,13 @@ def visualize_frame(args, frame_ds, static_ds, dynamic_pcd, gt_boxes):
     if args.show_gt:
         for box in gt_boxes:
             color = get_class_color(box["label"]) if args.gt_color_by_class else [1.0, 0.0, 0.0]
-            geometries.append(create_o3d_box(box["center"], box["extent"], box["yaw"], color))
+            geometries.append(create_o3d_box(box, color, args.gt_box_scale, args.gt_yaw_only))
+
+        if args.show_gt_labels or args.show_gt_ids:
+            print(
+                "Warning: Open3D legacy visualization does not support reliable 3D text labels here; "
+                "use --save-preview-png or --save-gt-overlay for class/id annotations."
+            )
 
     if not geometries:
         print("Warning: no geometries to visualize.")
@@ -482,11 +599,93 @@ def visualize_frame(args, frame_ds, static_ds, dynamic_pcd, gt_boxes):
         )
 
 
+def gt_overlay_dict(frame_id, gt_boxes):
+    boxes = []
+    for box in gt_boxes:
+        class_label = int(box["label"])
+        class_name = CLASS_NAMES.get(class_label, f"unknown_{class_label}")
+        object_id = box["object_id"]
+        boxes.append(
+            {
+                "class_label": class_label,
+                "class_name": class_name,
+                "object_id": object_id,
+                "center": np.asarray(box["center"], dtype=np.float64).tolist(),
+                "size": np.asarray(box["extent"], dtype=np.float64).tolist(),
+                "rotation": np.asarray(box["rotation"], dtype=np.float64).tolist(),
+                "text": make_gt_text(class_name, object_id),
+            }
+        )
+    return {"frame_id": int(frame_id), "boxes": boxes}
+
+
+def save_gt_overlay_json(path, frame_id, gt_boxes):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(gt_overlay_dict(frame_id, gt_boxes), f, indent=2)
+        f.write("\n")
+
+
+def get_box_xy_corners(box, scale, yaw_only):
+    rotation = get_box_rotation(box["rotation"], yaw_only)
+    extent = np.asarray(box["extent"], dtype=np.float64) * scale
+    center = np.asarray(box["center"], dtype=np.float64)
+    half_x = extent[0] / 2.0
+    half_y = extent[1] / 2.0
+    local_corners = np.asarray(
+        [
+            [-half_x, -half_y, 0.0],
+            [half_x, -half_y, 0.0],
+            [half_x, half_y, 0.0],
+            [-half_x, half_y, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    corners = center + local_corners @ rotation.T
+    return corners[:, :2]
+
+
+def save_preview_png(path, dynamic_pcd, gt_boxes, args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
+
+    points = np.asarray(dynamic_pcd.points)
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=160)
+    if len(points) > 0:
+        sample = points
+        if len(points) > 200000:
+            indices = np.linspace(0, len(points) - 1, 200000).astype(np.int64)
+            sample = points[indices]
+        ax.scatter(sample[:, 0], sample[:, 1], s=0.2, c="0.25", alpha=0.6, linewidths=0)
+
+    for box in gt_boxes:
+        label = int(box["label"])
+        color = get_class_color(label) if args.gt_color_by_class else [1.0, 0.0, 0.0]
+        corners = get_box_xy_corners(box, args.gt_box_scale, args.gt_yaw_only)
+        polygon = Polygon(corners, closed=True, fill=False, edgecolor=color, linewidth=1.5)
+        ax.add_patch(polygon)
+        class_name = CLASS_NAMES.get(label, f"unknown_{label}")
+        text = make_gt_text(class_name, box["object_id"])
+        center = np.asarray(box["center"], dtype=np.float64)
+        ax.text(center[0], center[1], text, color=color, fontsize=7, ha="center", va="center")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Dynamic points with GT boxes, top view")
+    ax.grid(True, linewidth=0.25, alpha=0.35)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def process_dynamic_frame(args, scene_name, frame_id, static_ds, view_enabled=False):
-    frame_path = build_frame_path(args.pcd_root, args.split, scene_name, frame_id)
+    frame_path = build_frame_path(args.pcd_root, scene_name, frame_id)
     static_path = build_static_path(
         args.pcd_root,
-        args.split,
         scene_name,
         args.static_voxel_size,
         args.background_root,
@@ -494,8 +693,8 @@ def process_dynamic_frame(args, scene_name, frame_id, static_ds, view_enabled=Fa
     output_path = build_output_path(args, scene_name, frame_id)
 
     print(f"\nFrame: {scene_name}/{frame_id:05d}")
-    print(f"frame path: {frame_path}")
-    print(f"static path: {static_path}")
+    print(f"loaded frame PLY path: {frame_path}")
+    print(f"loaded static path: {static_path}")
     if args.save:
         print(f"output path: {output_path}")
     if args.save and args.skip_existing and os.path.exists(output_path):
@@ -545,8 +744,19 @@ def process_dynamic_frame(args, scene_name, frame_id, static_ds, view_enabled=Fa
         write_ok = o3d.io.write_point_cloud(output_path, dynamic_pcd, format="ply")
         if not write_ok:
             raise RuntimeError(f"Failed to write dynamic PLY: {output_path}")
+        print(f"saved dynamic path: {output_path}")
 
     gt_boxes = maybe_load_gt(args, scene_name, frame_id, fail_on_missing=view_enabled)
+    print(f"GT boxes count: {len(gt_boxes)}")
+    overlay_enabled = args.save_gt_overlay or (args.show_gt and (args.show_gt_labels or args.show_gt_ids))
+    if overlay_enabled:
+        overlay_path = build_overlay_json_path(args, scene_name, frame_id)
+        save_gt_overlay_json(overlay_path, frame_id, gt_boxes)
+        print(f"saved overlay JSON path: {overlay_path}")
+    if args.save_preview_png:
+        preview_path = build_preview_png_path(args, scene_name, frame_id)
+        save_preview_png(preview_path, dynamic_pcd, gt_boxes, args)
+        print(f"saved preview PNG path: {preview_path}")
     if view_enabled:
         visualize_frame(args, frame_ds, static_ds, dynamic_pcd, gt_boxes)
 
@@ -557,14 +767,12 @@ def process_scene(args, scene_name, view_enabled=False):
     start_time = time.time()
     static_path = build_static_path(
         args.pcd_root,
-        args.split,
         scene_name,
         args.static_voxel_size,
         args.background_root,
     )
     frame_ids = get_scene_frame_ids(
         args.pcd_root,
-        args.split,
         scene_name,
         args.all_frames,
         args.frame_id,
@@ -623,9 +831,9 @@ def main():
     resolve_roots(args)
     validate_args(args)
 
-    scene_dirs = get_scene_dirs(args.pcd_root, args.split, args.scene_name, args.all_scenes)
+    scene_dirs = get_scene_dirs(args.pcd_root, args.scene_name, args.all_scenes)
     if not scene_dirs:
-        raise RuntimeError(f"No scenes found under {os.path.join(args.pcd_root, args.split)}")
+        raise RuntimeError(f"No scenes found under {args.pcd_root}")
     if not args.all_frames and args.frame_id is None:
         raise ValueError("--frame-id is required unless --all-frames is passed.")
 
@@ -634,6 +842,7 @@ def main():
 
     print("Dynamic PCD generation/view")
     print(f"  processing_root: {args.processing_root}")
+    print(f"  data_root: {args.data_root}")
     print(f"  pcd_root: {args.pcd_root}")
     print(f"  background_root: {args.background_root}")
     print(f"  object_root: {args.object_root}")
