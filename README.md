@@ -164,6 +164,30 @@ This script:
 - Converts 3D annotations to point cloud coordinate system
 - Saves point clouds as `.ply` files and annotations as `.txt` files
 
+### 2.1. Analyze PalletTruck Motion from Ground Truth
+Check whether `PalletTruck` objects are static or moving directly from
+`ground_truth.json`, without running a model or reading `.ply` files:
+```bash
+python tools/analyze_pallettruck_motion.py \
+    --data-root dataset/MTMC_Tracking_2025 \
+    --splits train val \
+    --movement-threshold 0.5 \
+    --step-threshold 0.1 \
+    --out-dir reports/pallettruck_motion
+```
+
+To inspect one scene:
+```bash
+python tools/analyze_pallettruck_motion.py \
+    --data-root dataset/MTMC_Tracking_2025 \
+    --splits train \
+    --scene-name Warehouse_017 \
+    --out-dir reports/pallettruck_motion
+```
+
+When `--out-dir` is provided, the tool writes
+`pallettruck_motion_summary.csv` and `pallettruck_motion_summary.json`.
+
 ### 3. Prepare Training Data
 Create training data for different components:
 
