@@ -16,3 +16,28 @@ python tools/view_ply_motion.py   --mode sequence   --folder /home/niran/Documen
 ```bash
 python tools/view_ply_motion.py   --mode sequence   --folder /home/niran/Documents/GitHub/AIC2025_Track1_ZV/dataset/pcd_dataset/test/pcd   --scene Warehouse_017   --voxel 0.05   --sleep 0.1   --max-files 100   --axis    --show-boxes   --show-label-text   --calibration-json /home/niran/Documents/data/aic2025/test/Warehouse_017/calibration.json   --show-cameras   --camera-scale 2.0   --camera-axis --show-camera-ids 
 ```
+
+```
+python tools/view_dynamic_pcd.py \
+  --processing-root "$BASE" \
+  --data-root "$DATA" \
+  --split train \
+  --scene-name Warehouse_000 \
+  --frame-id 0 \
+  --static-voxel-size 0.05 \
+  --compare-voxel-size 0.10 \
+  --distance-threshold 0.05 \
+  --show-static \
+  --show-gt \
+  --gt-color-by-class \
+  --gt-yaw-only \
+  --viewer gui \
+  --show-gt-id-labels \
+  --gt-id-label-scale 1.2 \
+  --gt-id-label-color 1,1,0 \
+  --show-static-in-gt-boxes \
+  --static-in-box-color 1,0,0 \
+  --static-in-box-point-size 5.0 \
+  --paint \
+  --save
+```
